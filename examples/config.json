@@ -1,0 +1,22 @@
+{
+  "data_path": "../data/evaluation.parquet",
+  "output": "../reports",
+  "comparison": {
+    "actual": "target",
+    "reference": "prediction_a",
+    "candidate": "prediction_b",
+    "reference_name": "Model A",
+    "candidate_name": "Model B",
+    "id_column": "row_id",
+    "time_column": "timestamp",
+    "entity_column": "entity_id",
+    "error_scale": 1,
+    "unit": "units",
+    "timezone": "UTC",
+    "tolerance": 1
+  },
+  "slices": ["segment", {"column": "measure_1", "bins": [0, 10, 20, "inf"], "right": false}],
+  "interactions": [["segment", "category"]],
+  "min_count": 30,
+  "metric": "mae_delta"
+}
