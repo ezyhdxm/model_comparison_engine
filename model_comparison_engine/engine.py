@@ -1,5 +1,5 @@
 """Public paired-model API for scalar regression targets."""
-# SETUP LOGIC: Diagnostics call inference only when requested; fitting is outside this package.
+# SETUP LOGIC: These paired-review APIs use existing predictions; optional cross-validation lives separately.
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd

@@ -24,7 +24,58 @@ When an estimator predicts a residual, supply `reference_offset="known_level"` a
 
 `Model(name, estimator, features, offset=None)` wraps any fitted object with `predict`. Feature order is explicit and may differ between the two models. Predictions must contain one scalar per input record; an `(n,1)` array is accepted, multi-output arrays are rejected. A pandas prediction must preserve the exact input index. Array predictions rely on the estimator's record-order contract.
 
-The engine performs no fitting, imputation, encoding or model deserialization. Include any required preprocessing inside the fitted estimator/pipeline you pass. Saved predictions avoid inference entirely.
+`compare_models` performs no fitting, imputation, encoding or model deserialization. Include any required preprocessing inside the fitted estimator/pipeline you pass. Saved predictions avoid inference entirely. The separate opt-in `walk_forward_compare` API below fits models when explicitly called.
+
+## Walk-forward cross-validation
+
+`walk_forward_splits(data, time_column, settings, timezone='UTC')` is a model-independent splitter. `WalkForwardConfig` counts **observed local dates**, so one busy date cannot straddle Train and Validation. It rejects invalid feature timestamps and overlapping validation windows. Nothing reads targets or fits a model while planning folds.
+
+| Setting | Meaning |
+|---|---|
+| `min_train_dates` | Minimum scheduled training dates before the first fold |
+| `validation_dates` | Number of dates in each complete held-out block |
+| `embargo_dates` | Excluded dates immediately before each validation block |
+| `step_dates` | Distance between validation starts; default is validation length; may be larger but cannot overlap |
+| `max_train_dates` | `None` for expanding history; a positive cap for a rolling training window |
+| `n_splits` | Keep up to this many latest complete folds; actual count is returned explicitly |
+| `holdout_dates` | Reserve this many final dates from **all** folds; default zero means no automatic final reservation |
+| `holdout_embargo_dates` | Additional excluded buffer before a nonzero final holdout |
+| `label_available_column` | Optional timestamp at which each target label became observable; otherwise label availability is the caller's assumption |
+
+Partial final validation blocks remain unscored. With dates January 1–12, 2026, `min_train_dates=3`, `validation_dates=2`, `embargo_dates=1` and `holdout_dates=2`, the folds validate January 5–6, 7–8 and 9–10. January 11–12 never enter fitting or validation. `max_train_dates=3` makes the last fold train January 5–7 instead of January 1–7.
+
+If a label availability mapping is supplied, training records whose label timestamp is missing or is at/after the first validation date's midnight are excluded. `train_rows` reports rows after this purge; `scheduled_train_rows` and `label_purged_rows` disclose the difference. Date boundaries describe the scheduled window before label purging. Both estimators subsequently use the same finite-target training records; their feature-specific missing values are not silently filtered.
+
+```python
+# SETUP LOGIC: clone copies estimator configuration without carrying fitted sklearn state into another fold.
+from sklearn.base import clone
+from model_comparison_engine import TrainableModel, WalkForwardConfig, walk_forward_compare
+# CONFIGURATION LOGIC: The caller declares features, preprocessing and temporal policy before looking at results.
+settings = WalkForwardConfig(min_train_dates=30, validation_dates=5, embargo_dates=1,
+    max_train_dates=60, n_splits=4, holdout_dates=10, holdout_embargo_dates=1,
+    label_available_column="label_known_time")
+reference = TrainableModel("Model A", lambda: clone(model_a), ["feature_1", "category"])
+candidate = TrainableModel("Model B", lambda: clone(model_b), ["feature_1", "feature_2", "category"])
+# MODELING LOGIC: Each factory returns a fresh full preprocessing/model pipeline, fitted only on that fold's training rows.
+result = walk_forward_compare(data, "target", reference, candidate, time_column="timestamp",
+    settings=settings, id_column="row_id", entity_column="entity_id", timezone="UTC", unit="units")
+# REPORTING LOGIC: The usual arbitrary slices and intersections apply to held-out predictions from every fold.
+summary = result.comparison.summary()
+by_group = result.comparison.slice("segment")
+per_fold = result.fold_metrics
+# FILE IO LOGIC: Export folds.csv, fold_metrics.csv, oof_predictions.parquet and walk_forward.json with the paired report.
+folder = result.export("reports/cross_validation", slices=["segment"], interactions=[("segment", "category")])
+```
+
+Each `TrainableModel` accepts `name`, `factory`, ordered `features`, optional `transformer_factory` and optional additive `offset`. Factories must return **fresh unfitted** objects. Reusing the same object across folds/models is rejected. A transformer implements `fit(X, y)` and `transform(X)`; it is fitted only on the training rows and transforms validation without reading validation targets. A complete estimator pipeline can instead own its preprocessing. No category detection, imputation, encoding, scaling or model parameters are inserted. Models must implement `fit(X, y)` and return one prediction per row from `predict(X)`; pandas outputs must preserve row indexes, and array outputs rely on the estimator's order contract.
+
+The training target is shared by the two models. `actual=` can specify a separate scoring level when the supplied target is a residual; each model's `offset` is added using the existing paired-comparison convention. Use factories that contain no external evaluation data, fitted state or early-stopping holdout. Engine temporal controls cannot prove that an arbitrary factory or precomputed feature is causal.
+
+`WalkForwardResult` holds `comparison`, `predictions`, `folds`, `fold_metrics` and `configuration`. Each source row is scored at most once and keeps `cv_row_position` and `cv_fold`. Pooled losses weight records; per-fold losses disclose drift and differing support. Exports describe the factory names and features, not a serialized executable training recipe: retain your factory code, library versions and parameters with the experiment.
+
+Cross-validation is development evidence, not a final untouched test or a significance test. Later folds may train on labels from earlier validation dates once those labels are available. Repeated model/slice selection on CV still requires separate final confirmation. For delayed or overlapping labels, supply label availability and a suitable embargo; those controls do not infer horizon length. Reserve final dates explicitly, or provide a development-only DataFrame. The API never evaluates or refits on the reserved final holdout and does not choose a winning model automatically. The comparison notebook stays prediction-only; [examples/walk_forward.py](../examples/walk_forward.py) contains a separate disabled-by-default training example.
+
+Out-of-fold scoring is **retrospective**: `label_available_column` gates each fold's training, but a held-out outcome can be scored even if it became available after a later decision cutoff. Before using these scores to freeze a model for a final holdout, restrict selection to outcomes known before that decision time. The generic comparison API makes no automatic selection and does not infer that cutoff for you.
 
 ## Join predictions by identity
 

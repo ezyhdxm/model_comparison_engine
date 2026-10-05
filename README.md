@@ -65,5 +65,30 @@ comparison = compare_models(
 - Optional per-model additive offsets when predictions are relative to a known reference value.
 - Immutable local review bundles with configuration, filter history and input fingerprint.
 - Notebook controls export the last **applied** result, not pending edits.
+- Optional expanding/rolling walk-forward fitting with fold-local preprocessing, label-availability purging and an excluded final holdout.
 
-Read [USAGE.md](docs/USAGE.md) for data contracts, file-based runs, custom comparisons and interpretation. This release evaluates scalar regression; it does not implement classification metrics, train models or choose a validation/test partition.
+## Optional walk-forward cross-validation
+
+Use `walk_forward_compare` when you explicitly want to fit fresh models on earlier dates and score later dates. `compare_models`, `compare_predictions` and the review notebook remain prediction-only APIs.
+
+```python
+# SETUP LOGIC: A factory returns a fresh unfitted estimator or complete preprocessing pipeline per fold.
+from sklearn.base import clone
+from model_comparison_engine import TrainableModel, WalkForwardConfig, walk_forward_compare
+# CONFIGURATION LOGIC: Choose chronological windows before reviewing gains; reserve the final dates separately.
+folds = WalkForwardConfig(min_train_dates=30, validation_dates=5, embargo_dates=1,
+                          n_splits=4, holdout_dates=10, holdout_embargo_dates=1)
+# MODELING LOGIC: Only this explicit API fits; both models use the same available training labels and held-out records.
+result = walk_forward_compare(
+    data, target="target", time_column="timestamp", settings=folds,
+    reference=TrainableModel("Model A", lambda: clone(model_a), ["feature_1", "feature_2"]),
+    candidate=TrainableModel("Model B", lambda: clone(model_b), ["feature_1", "feature_2", "feature_3"]),
+    id_column="row_id", entity_column="entity_id",
+)
+# FILE IO LOGIC: Save fold boundaries, fold losses, held-out predictions and a normal paired review.
+folder = result.export("reports/cross_validation", slices=["segment"])
+```
+
+For these scikit-learn factories, install `python -m pip install -e ".[training]"`. Other estimators require only their own library and the `fit`/`predict` protocol. The [opt-in synthetic example](examples/walk_forward.py) shows explicitly configured categorical preprocessing. No category names, encoders or estimator parameters are inferred. If labels arrive later than their record timestamps, map `label_available_column`; unknown or boundary-late labels are purged from each training fold.
+
+Read [USAGE.md](docs/USAGE.md) for data contracts, walk-forward policy, custom comparisons and interpretation. This release supports scalar regression, not classification metrics. Cross-validation does not evaluate the reserved final test or perform automatic model selection.
