@@ -2,7 +2,8 @@
 # SETUP LOGIC: Standard-library normal quantiles avoid requiring a training or statistics dependency.
 from statistics import NormalDist
 import numpy as np
-from matplotlib.figure import Figure
+from .plot_style import (make_figure, finish_figure, figure_title, categorical_ticks,
+                         sequence_ticks, row_figure_height)
 from .diagnostics import _quantiles
 
 # CONFIGURATION LOGIC: These limits affect drawn points only, never diagnostic table populations.
@@ -39,8 +40,8 @@ def _empty_axis(axis, title, message):
     # PLOTTING LOGIC: Empty data produce an explicit explanation instead of a misleading zero-valued curve.
     axis.set_title(title)
     axis.text(.5, .5, message, transform=axis.transAxes, ha='center', va='center', color=REFERENCE_COLOR)
-    axis.set_xticks([])
-    axis.set_yticks([])
+    categorical_ticks(axis, [])
+    categorical_ticks(axis, [], axis='y')
 
 
 def _histogram(axis, errors, error_label):
@@ -111,13 +112,12 @@ def _daily(axis, table, scale, error_label, total):
         _empty_axis(axis, 'Daily error', 'Date metadata unavailable\nNo records with known dates')
         return
     x = np.arange(len(table))
-    ticks = x[::max(1, len(table) // 8)]
-    axis.plot(x, table['candidate_mae'] / scale, color=COLOR, marker='.', label='MAE')
-    axis.plot(x, table['candidate_bias'] / scale, color='#c67446', marker='.', label='Bias')
+    marker = '.' if len(table) <= 60 else None
+    axis.plot(x, table['candidate_mae'] / scale, color=COLOR, marker=marker, linewidth=1, alpha=.8, label='MAE')
+    axis.plot(x, table['candidate_bias'] / scale, color='#c67446', marker=marker, linewidth=1, alpha=.8, label='Bias')
     axis.axhline(0, color=REFERENCE_COLOR, linewidth=.8)
-    axis.set(xticks=ticks, xticklabels=table['__date'].astype(str).iloc[ticks], ylabel=error_label,
-             title=f'Daily error | {int(table["n"].sum()):,} of {total:,} dated records')
-    axis.tick_params(axis='x', rotation=30, labelsize=8)
+    sequence_ticks(axis, table['__date'], max_ticks=5)
+    axis.set(ylabel=error_label, title=f'Daily error | {int(table["n"].sum()):,} of {total:,} dated records')
     axis.legend(fontsize=8)
 
 
@@ -131,19 +131,19 @@ def candidate_figure(rows, tables, *, name='Candidate', unit='units', error_scal
     if not np.isfinite(error_scale) or error_scale <= 0:
         raise ValueError('error_scale must be a positive finite number.')
     # PLOTTING LOGIC: Unmanaged figures render once in notebooks and save without changing global plot state.
-    figure = Figure(figsize=(15, 9), constrained_layout=True)
+    figure = make_figure((16, 10))
     axes = figure.subplots(2, 3).ravel()
     n = len(rows)
     population = tables['summary']['population'].iloc[0] if 'population' in tables['summary'] else 'candidate'
     population_label = 'paired records' if population == 'paired' else 'candidate-valid records'
-    figure.suptitle(f'{name} diagnostics | {n:,} {population_label}\n'
-                   f'Signed error = (prediction − actual) × {error_scale:g}; error unit: {unit}; '
-                   f'scatter displays at most {POINT_LIMIT:,} points')
+    figure_title(figure, f'{name} diagnostics | {n:,} {population_label}',
+                 f'Signed error = (prediction − actual) × {error_scale:g}; error unit: {unit}; '
+                 f'scatter displays at most {POINT_LIMIT:,} points')
     if not n:
         for axis, title in zip(axes, ['Signed residuals', 'Calibration', 'Residual vs fitted',
                                       'Normal Q–Q', 'Absolute residual vs fitted', 'Daily error']):
             _empty_axis(axis, title, 'No valid candidate records')
-        return figure
+        return finish_figure(figure)
     # CORE LOGIC: STEP 1 — Select display positions while leaving full-population aggregates intact.
     # Input: prediction=[1,2,3], error=[0,-1,2], POINT_LIMIT=3000.
     # Output: positions=[0,1,2], selected_predictions=[1,2,3], selected_errors=[0,-1,2].
@@ -166,21 +166,21 @@ def candidate_figure(rows, tables, *, name='Candidate', unit='units', error_scal
     _qq(axes[3], errors, error_label)
     _absolute_scatter(axes[4], fitted, np.abs(selected_errors), target_label, error_label, n)
     _daily(axes[5], tables['daily'], error_axis_scale, error_label, n)
-    return figure
+    return finish_figure(figure)
 
 
 def worst_slices_figure(table, *, unit='units', title='Candidate worst slices'):
     """Show ranked slice MAE alongside support and total absolute-error contribution."""
     # PLOTTING LOGIC: Preserve table ranking and flags; shares are comparable within each slice specification.
-    figure = Figure(figsize=(14, min(16, max(4, .35 * len(table) + 2))), constrained_layout=True)
+    labels = [f'{spec}: {group}' + (' †' if low else '')
+              for spec, group, low in zip(table['spec'], table['group'], table['low_support'])]
+    figure = make_figure((15, row_figure_height(labels)))
     axes = figure.subplots(1, 3, gridspec_kw={'width_ratios': [3, 1, 1.4]})
-    figure.suptitle(title + '\n† below minimum support; shares use the full candidate population per specification')
+    figure_title(figure, title, '† below minimum support · Shares use the full candidate population per specification')
     if table.empty:
         for axis, heading in zip(axes, ['Candidate MAE', 'Records', 'Share of absolute error']):
             _empty_axis(axis, heading, 'No configured slice groups')
-        return figure
-    labels = [f'{spec}: {group}' + (' †' if low else '')
-              for spec, group, low in zip(table['spec'], table['group'], table['low_support'])]
+        return finish_figure(figure)
     y = np.arange(len(table))
     scale = _display_scale(table['candidate_mae'])
     colors = np.where(table['low_support'], '#b1bdc5', COLOR)
@@ -189,6 +189,8 @@ def worst_slices_figure(table, *, unit='units', title='Candidate worst slices'):
     axes[2].barh(y, table['error_share_pct'], color=COLOR)
     for axis, heading, label in zip(axes, ['Candidate MAE', 'Records', 'Share of absolute error'],
                                     [_unit_label(unit, scale), 'N', '% of total error']):
-        axis.set(yticks=y, yticklabels=labels if axis is axes[0] else [], title=heading, xlabel=label)
+        categorical_ticks(axis, labels if axis is axes[0] else ['']*len(labels), axis='y', width=32)
+        axis.set(title=heading, xlabel=label)
+        axis.margins(y=.02, x=.08)
         axis.invert_yaxis()
-    return figure
+    return finish_figure(figure)

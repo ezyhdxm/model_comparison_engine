@@ -37,13 +37,15 @@ class WalkForwardResult:
     configuration: dict
 
     def export(self, folder, *, slices=None, interactions=None, min_count=30, metric='mae_delta',
-               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20):
+               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20,
+               temporal=None, temporal_population=None, temporal_entity=None):
         """Export the ordinary paired review plus fold boundaries, exact OOF rows and fold metrics."""
         # FILE IO LOGIC: Extend the newly created immutable review directory; estimator objects are not serialized.
         output = self.comparison.export(folder, slices=slices, interactions=interactions,
                                         min_count=min_count, metric=metric, inference=inference,
                                         include_candidate=include_candidate, candidate_population=candidate_population,
-                                        candidate_top_n=candidate_top_n)
+                                        candidate_top_n=candidate_top_n, temporal=temporal,
+                                        temporal_population=temporal_population, temporal_entity=temporal_entity)
         self.folds.to_csv(output/'folds.csv', index=False)
         self.fold_metrics.to_csv(output/'fold_metrics.csv', index=False)
         self.predictions.to_parquet(output/'oof_predictions.parquet', index=False)
@@ -61,9 +63,9 @@ class WalkForwardResult:
         section += 'Shared training history and serial dependence can violate the independent-unit assumption in the optional loss tests.</p>'
         section += '<p><a href="folds.csv">Fold boundaries</a> · <a href="fold_metrics.csv">Exact fold metrics</a> · '
         section += '<a href="oof_predictions.parquet">Out-of-fold predictions</a> · <a href="walk_forward.json">Configuration</a></p>'
-        section += table.head(100).to_html(index=False, escape=True)+ '</section>'
+        section += '<div class="table-wrap">'+table.head(100).to_html(index=False, escape=True)+ '</div></section>'
         report = output/'report.html'
-        report.write_text(report.read_text(encoding='utf-8').replace('</body>', section+'</body>'), encoding='utf-8')
+        report.write_text(report.read_text(encoding='utf-8').replace('</main>', section+'</main>'), encoding='utf-8')
         return output
 
 

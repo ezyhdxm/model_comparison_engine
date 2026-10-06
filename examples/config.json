@@ -44,5 +44,16 @@
     "min_units": 10
   },
   "candidate_population": "candidate",
-  "include_candidate": true
+  "include_candidate": true,
+  "temporal": {
+    "frequency": "1D",
+    "signal": "bias",
+    "rolling_bins": 10,
+    "max_lag": 20,
+    "min_bin_count": 1,
+    "min_segment_bins": 8,
+    "change_penalty": 3.0,
+    "max_changes": 3
+  },
+  "temporal_population": "candidate"
 }

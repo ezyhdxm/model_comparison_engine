@@ -2,13 +2,17 @@
 # SETUP LOGIC: Widgets and figures are created on demand; importing this module reads no data.
 from html import escape
 from io import BytesIO
+from dataclasses import replace
 import numpy as np
 from pandas.api.types import is_numeric_dtype
 import ipywidgets as w
 from IPython.display import display
 from .data import read_data
+from .ui_style import control, row, section, disclosure, hero, badge, table_html, style_root
 from .engine import Comparison, compare_predictions
 from .inference import InferenceConfig
+from .temporal import TemporalConfig
+from . import temporal_plots
 from .diagnostics import candidate_tables
 from .slices import Slice, default_slices
 from . import plots, inference_plots, diagnostic_plots
@@ -34,16 +38,13 @@ def _image(figure):
 def _preview(table):
     # UI LOGIC: Bound the on-screen table; complete tables remain in the export and public result API.
     columns = [c for c in ['group','x','y','n','reference_mae','candidate_mae','mae_improvement_pct','p95_delta','low_support'] if c in table]
-    shown = table.loc[:,columns].head(100)
-    note = f'<p>Showing {len(shown):,} of {len(table):,} groups. Export contains every group and metric.</p>'
-    return w.HTML(note+'<div style="max-height:420px;overflow:auto">'+shown.to_html(index=False,escape=True,float_format=lambda x:f'{x:.5g}')+'</div>')
+    shown = table.loc[:,columns]
+    return w.HTML(table_html(shown)+f'<p class="analysis-help">{len(table):,} total groups; export includes every group and metric.</p>')
 
 
 def _table(table, title):
     # UI LOGIC: Keep full precision in public tables while bounding the notebook's visible records.
-    shown = table.head(100)
-    note = f'<h4>{escape(title)}</h4><p>Showing {len(shown):,} of {len(table):,} rows.</p>'
-    return w.HTML(note+'<div style="max-height:420px;overflow:auto">'+shown.to_html(index=False,escape=True,float_format=lambda x:f'{x:.5g}')+'</div>')
+    return w.HTML(table_html(table, title=title))
 
 
 def _filter_text(condition):
@@ -64,8 +65,13 @@ class ComparisonPanel:
     def __init__(self, data=None, *, actual=None, predictions=None, id_column=None, time_column=None,
                  entity_column=None, error_scale=1, unit='units', timezone='UTC',
                  default_slices=None, tolerance=1, reference_offset=None, candidate_offset=None,
-                 inference=None, candidate_population='candidate'):
+                 inference=None, candidate_population='candidate', temporal=None):
+        # CONFIGURATION LOGIC: Preserve advanced API settings while exposing common temporal choices in the form.
+        self.temporal_defaults = TemporalConfig(**temporal) if isinstance(temporal,dict) else temporal
+        if self.temporal_defaults is not None and not isinstance(self.temporal_defaults,TemporalConfig):
+            raise TypeError('temporal must be a TemporalConfig, a dictionary, or None.')
         self.result, self.applied_specs, self.busy = None, None, False
+        self._applied_control_state = None
         self.supplied_slices = default_slices
         self.prediction_mapping = predictions
         self.offsets = dict(reference_offset=reference_offset,candidate_offset=candidate_offset)
@@ -121,30 +127,106 @@ class ComparisonPanel:
         self.applied = w.HTML()
         self.views = w.Tab(children=[w.HTML('Apply to calculate the common sample.')])
         self.views.set_title(0,'Results')
-        inputs = w.VBox([w.HBox([self.path,self.load]),w.HBox([self.actual,self.reference,self.candidate]),
-                         w.HBox([self.identity,self.time,self.entity]),w.HBox([self.scale,self.unit]),w.HBox([self.zone,self.tolerance])])
-        options = w.Accordion(children=[inputs])
-        options.set_title(0,'Data and prediction columns')
-        controls = w.VBox([w.HBox([self.first,self.second]),w.HBox([self.first_bins,self.first_right]),
-                           w.HBox([self.second_bins,self.second_right]),w.HBox([self.minimum,self.top_n,self.metric])])
-        inference_controls = w.VBox([w.HBox([self.loss,self.test_unit,self.correction]),w.HBox([self.alpha,self.min_units]),
-                                     w.HTML('Two-sided paired mean loss tests. Negative t favors the candidate. Date/entity means receive equal weight; '
-                                            'minimum records and minimum units must both pass. Each table is a separate correction family.'),
-                                     self.candidate_population])
-        self.widget = w.VBox([w.HTML('<h3>Compare two models</h3><p>Choose a reference, candidate and slices. Negative error delta means improvement. Units must match before comparison.</p>'),
-                              options,controls,inference_controls,w.HTML('<b>Optional population filters</b> · two rows form an intersection; blank = no restriction'),
-                              *[item['widget'] for item in self.filters],self.apply,self.status,self.applied,self.views,
-                              w.HBox([self.export_path,self.export_button])])
+        self._make_widget()
         self.first.observe(lambda _:self.set_bins(self.first,self.first_bins,self.first_right),names='value')
         self.second.observe(lambda _:self.set_bins(self.second,self.second_bins,self.second_right),names='value')
         if self.data is not None:
             self.configure(actual,id_column,time_column,entity_column)
+        self._watch_controls()
+
+    def _make_widget(self):
+        # UI LOGIC: Present essential choices first and keep specialist settings in compact disclosures.
+        # UI LOGIC: Time diagnostics are opt-in and become part of the next explicit Apply.
+        settings = self.temporal_defaults or TemporalConfig()
+        frequencies = [('15 minutes','15min'),('Hourly','1h'),('Daily','1D'),('Weekly','7D')]
+        if settings.frequency not in dict(frequencies).values():
+            frequencies.append((settings.frequency,settings.frequency))
+        self.temporal_enabled = w.Checkbox(value=self.temporal_defaults is not None, description='Include time-series diagnostics')
+        self.temporal_frequency = w.Dropdown(options=frequencies,value=settings.frequency,description='Time interval:')
+        self.temporal_signal = w.Dropdown(options=[('Mean residual (bias)','bias'),('Mean absolute error','mae')],
+                                           value=settings.signal,description='Time-series signal:')
+        self.temporal_rolling = w.BoundedIntText(value=settings.rolling_bins,min=1,max=10000,description='Rolling window (bins):')
+        self.temporal_min_count = w.BoundedIntText(value=settings.min_bin_count,min=1,max=100000000,description='Minimum records per bin:')
+        self.temporal_max_lag = w.BoundedIntText(value=settings.max_lag,min=0,max=1000,description='Autocorrelation lags:')
+        self.pending = w.HTML(badge('Ready to configure'))
+        data_inputs = section('Data and predictions',row(self.path,self.load),row(self.actual,self.reference,self.candidate),
+            disclosure('Identifiers, units and timestamp settings',row(self.identity,self.time,self.entity),
+                       row(self.scale,self.unit,self.zone,self.tolerance)),
+            note='Load a saved table, then choose the observed outcome and the two prediction columns.',step='01')
+        slice_controls = section('Choose the view',row(self.first,self.second,self.metric),row(self.minimum,self.top_n),
+            disclosure('Custom bin boundaries',row(self.first_bins,self.first_right),row(self.second_bins,self.second_right),
+                       w.HTML('<p class="analysis-help">Comma-separated edges, for example -inf, 0, 1, inf. Leave blank for unbinned groups.</p>')),
+            note='Negative candidate-minus-reference error deltas indicate improvement. Low-support groups remain visibly flagged.',step='02')
+        inference_controls = disclosure('Inference and candidate diagnostics',
+            row(self.loss,self.test_unit,self.correction),row(self.alpha,self.min_units,self.candidate_population),
+            w.HTML('<p class="analysis-help">Two-sided paired mean loss tests. Negative t favors the candidate. Date/entity means receive equal weight. '
+                   'Minimum records and units must both pass; each table is a separate correction family.</p>'))
+        temporal_controls = disclosure('Optional time-series diagnostics',row(self.temporal_enabled),
+            row(self.temporal_frequency,self.temporal_signal),row(self.temporal_rolling,self.temporal_min_count,self.temporal_max_lag),
+            w.HTML('<p class="analysis-help">Enable before Apply to inspect trends, rolling errors, autocorrelation, spectral peaks and changes. '
+                   'Requires a timestamp column. These diagnostics describe the selected records.</p>'))
+        filters = disclosure('Optional population filters',*[item['widget'] for item in self.filters],
+            w.HTML('<p class="analysis-help">The two filter rows form an intersection. Blank conditions leave the population unrestricted.</p>'))
+        actions = row(self.apply,self.pending).add_class('analysis-actions')
+        self.status.add_class('analysis-status')
+        self.applied.add_class('analysis-applied')
+        self.views.layout.width = '100%'
+        self.views.children = [w.HTML('<div class="analysis-card-heading"><h3>Your review will appear here</h3>'
+            '<p>Choose your inputs and click Apply comparison. Results and exports retain the last successful applied configuration.</p></div>')]
+        self.views.set_title(0,'Results')
+        export = section('Save the applied review',row(self.export_path,self.export_button),
+                         note='Export figures, full tables and an HTML report using the last successful comparison.')
+        self.widget = style_root(w.VBox([hero('Compare two models','Inspect a reference and candidate on the same records, then explore where errors improve or deteriorate.',
+            tags=('Saved predictions','Explicit Apply','Portable review')),data_inputs,slice_controls,inference_controls,temporal_controls,filters,
+            actions,self.status,self.applied,self.views,export]))
+        for item in [self.path,self.export_path]:
+            control(item,wide=True)
+
+    def _watch_controls(self):
+        # UI LOGIC: Edits only update a badge; expensive work remains behind the explicit Apply button.
+        names = ['actual','reference','candidate','identity','time','entity','scale','unit','zone','tolerance',
+                 'first','second','first_bins','second_bins','first_right','second_right','minimum','top_n','metric']
+        names += ['loss','test_unit','correction','alpha','min_units','candidate_population',
+                  'temporal_enabled','temporal_frequency','temporal_signal','temporal_rolling','temporal_min_count','temporal_max_lag']
+        self._pending_controls = [getattr(self,name) for name in names]
+        self._pending_controls += [item[key] for item in self.filters for key in ['column','low','high','strict','categories']]
+        for item in self._pending_controls:
+            control(item,wide=item is self.metric)
+            item.observe(self._pending_changed,names='value')
+        self._pending_changed()
+
+    def _control_state(self):
+        # UI LOGIC: Compare literal widget values plus the loaded-table identity; export-path edits are independent.
+        return (id(self.data),tuple(item.value for item in self._pending_controls))
+
+    def _pending_changed(self, change=None):
+        # UI LOGIC: Reverting every edit restores the applied badge without recalculating anything.
+        if self.busy:
+            self.pending.value = badge('Working · controls are locked','busy')
+        elif self._applied_control_state is None:
+            self.pending.value = badge('Not applied · choose inputs and Apply','neutral')
+        elif self._control_state() != self._applied_control_state:
+            self.pending.value = badge('Pending changes · Apply to update results','pending')
+        else:
+            self.pending.value = badge('Applied · results match these controls','ready')
+
+    def _set_busy(self, busy, *, exporting=False):
+        # UI LOGIC: Lock mutable inputs while an explicit action runs and restore the existing result afterward.
+        self.busy = busy
+        self.apply.disabled = self.load.disabled = busy
+        self.export_button.disabled = busy or self.result is None
+        for item in self._pending_controls:
+            item.disabled = busy
+        self.apply.description = 'Comparing…' if busy and not exporting else 'Apply comparison'
+        self.export_button.description = 'Exporting…' if busy and exporting else 'Export applied review'
+        self._pending_changed()
 
     def make_filter(self):
         # UI LOGIC: Two optional filters define an intersection of user-selected metadata conditions.
         fields = dict(column=w.Dropdown(description='Column:'),low=w.Text(description='Lower:'),high=w.Text(description='Upper:'),
                       strict=w.Checkbox(value=False,description='Strict lower >'),categories=w.Text(description='Values:',placeholder='A; B; C (optional)'))
-        fields['widget'] = w.VBox([w.HBox([fields['column'],fields['low'],fields['high']]),w.HBox([fields['strict'],fields['categories']])])
+        fields['widget'] = w.VBox([row(fields['column'],fields['low'],fields['high']),row(fields['strict'],fields['categories'])],
+                                   layout=w.Layout())
         return fields
 
     def configure(self, actual=None, identity=None, time=None, entity=None):
@@ -199,6 +281,9 @@ class ComparisonPanel:
 
     def load_data(self, _=None):
         # FILE IO LOGIC: Replace the input only on an explicit load; preserve the applied result on error.
+        self._set_busy(True)
+        self.load.description = 'Loading…'
+        self.status.value = 'Loading the selected table…'
         try:
             data = read_data(self.path.value,string_columns='all')
             self.data = data
@@ -209,6 +294,9 @@ class ComparisonPanel:
             self.configure()
         except Exception as exc:
             self.status.value = '<b>Input error:</b> '+escape(str(exc))
+        finally:
+            self.load.description = 'Load data'
+            self._set_busy(False)
 
     def specs(self):
         # CONFIGURATION LOGIC: Snapshot the currently requested boundaries, names and closure.
@@ -278,11 +366,41 @@ class ComparisonPanel:
             details.set_title(index,label)
         return w.VBox([note,_image(figure),details])
 
+    def temporal_settings(self):
+        # CONFIGURATION LOGIC: Snapshot only on Apply; retain advanced limits supplied through TemporalConfig.
+        if not self.temporal_enabled.value:
+            return None
+        if self.time.value is None:
+            raise ValueError('Select a Timestamp column before enabling time-series diagnostics.')
+        return replace(self.temporal_defaults or TemporalConfig(),frequency=self.temporal_frequency.value,
+                       signal=self.temporal_signal.value,rolling_bins=self.temporal_rolling.value,
+                       min_bin_count=self.temporal_min_count.value,max_lag=self.temporal_max_lag.value)
+
+    def temporal_view(self, result, settings, population):
+        # UI LOGIC: The default review skips optional temporal computation entirely.
+        if settings is None:
+            return w.HTML('<p class="analysis-help">Enable Optional time-series diagnostics above, select a timestamp, '
+                          'then Apply. Existing predictions are reused; no model is fitted.</p>')
+        # REPORTING LOGIC: The temporal population matches the applied candidate diagnostics, including filters.
+        tables = result.temporal_diagnostics(settings,population=population)
+        note = w.HTML('<p>Fixed elapsed-time bins use UTC. Positive residual means overprediction. '
+                      'Missing intervals remain gaps; bins below the minimum support are excluded from time signals. '
+                      'Spectral peaks and offline mean-shift candidates are exploratory, with no significance stars. '
+                      'Check coverage and population composition before changing a feature or model.</p>')
+        figure = temporal_plots.temporal_figure(tables,name=result.candidate_name,unit=result.unit)
+        event_figure = temporal_plots.event_lag_figure(tables['event_autocorrelation'],name=result.candidate_name,unit=result.unit)
+        labels = [('change_points','Mean shifts'),('autocorrelation','Clock lags'),('event_autocorrelation','Entity event lags'),
+                  ('spectrum','Spectrum'),('series','Time bins')]
+        details = w.Tab(children=[_table(tables[key],label) for key,label in labels])
+        for index,(_,label) in enumerate(labels):
+            details.set_title(index,label)
+        return w.VBox([note,_table(tables['summary'],'Temporal coverage'),_image(figure),_image(event_figure),details])
+
     def run(self, _=None):
         # UI LOGIC: Publish result state only after a successful computation; previous exports remain valid.
         if self.busy:
             return
-        self.busy, self.apply.disabled = True, True
+        self._set_busy(True)
         self.status.value = 'Comparing saved predictions on common rows...'
         try:
             if self.data is None:
@@ -310,45 +428,54 @@ class ComparisonPanel:
                                         alpha=self.alpha.value,min_units=self.min_units.value)
             inference = result.inference_config(inference)
             population,min_count,metric = self.candidate_population.value,self.minimum.value,self.metric.value
+            temporal = self.temporal_settings()
             candidate_count = result.coverage['candidate_evaluable'] if population == 'candidate' else len(result.rows)
             if not candidate_count and result.rows.empty:
                 raise ValueError(f'No finite candidate records in the selected diagnostic population. Coverage: {result.coverage}')
             title = f'{candidate} vs {reference} | {first.column}'+(f' × {second.column}' if second else '')
             views = self.paired_views(result,first,second,inference,min_count,metric,title)
-            views += [self.candidate_view(result,first,second,population,min_count,self.top_n.value),_table(result.missingness(),'Input missingness')]
+            views += [self.candidate_view(result,first,second,population,min_count,self.top_n.value),
+                      self.temporal_view(result,temporal,population),_table(result.missingness(),'Input missingness')]
             # UI LOGIC: Publish the complete view and its matching export state only after every calculation succeeds.
             self.views.children = views
-            for i,label in enumerate(['Overview','Slices','Dates','Candidate','Missingness']):
+            for i,label in enumerate(['Overview','Slices','Dates','Candidate','Time series','Missingness']):
                 self.views.set_title(i,label)
             self.result,self.applied_specs = result,(first,second)
             self.applied_filters,self.applied_min_count = result.filter_history,min_count
             self.applied_metric,self.applied_inference = metric,inference
             self.applied_candidate_population = population
+            self.applied_temporal = temporal
             self.applied_top_n = self.top_n.value
+            self._applied_control_state = self._control_state()
             self.export_button.disabled = False
             filters_text = '; '.join(_filter_text(f) for f in result.filter_history) or 'All supplied records'
             self.applied.value = ('<b>Applied:</b> '+escape(title)+f' | {len(result.rows):,} paired records<br><b>Population:</b> '+escape(filters_text)+
                                   f'<br><b>Inference:</b> {inference.loss}, unit={inference.unit}, {inference.correction.upper()}, '
                                   f'alpha={inference.alpha:g}, minimum records={min_count}, minimum units={inference.min_units}; '
-                                  f'<b>Candidate population:</b> {population}')
+                                  f'<b>Candidate population:</b> {population}; '
+                                  '<b>Time diagnostics:</b> '+escape(f'{temporal.frequency}, {temporal.signal}' if temporal else 'off'))
             self.status.value = 'Ready. Controls affect the next Apply. Export uses the applied choices. Dependence across dates and repeated exploration still require care.'
         except Exception as exc:
             self.status.value = '<b>Comparison error:</b> '+escape(str(exc))+' Previous applied result is unchanged.'
         finally:
-            self.busy,self.apply.disabled = False,False
+            self._set_busy(False)
 
     def export(self, _=None):
         # FILE IO LOGIC: Export the applied data/specifications, never newly edited but unapplied controls.
         if self.result is None or self.busy:
             return
+        self._set_busy(True,exporting=True)
         try:
             first,second = self.applied_specs
             output = self.result.export(self.export_path.value,slices=[first],interactions=[(first,second)] if second else [],
                                         min_count=self.applied_min_count,metric=self.applied_metric,inference=self.applied_inference,
-                                        include_candidate=True,candidate_population=self.applied_candidate_population,candidate_top_n=self.applied_top_n)
+                                        include_candidate=True,candidate_population=self.applied_candidate_population,candidate_top_n=self.applied_top_n,
+                                        temporal=self.applied_temporal,temporal_population=self.applied_candidate_population)
             self.status.value = 'Saved complete PNG, CSV and HTML review to '+escape(str(output))
         except Exception as exc:
             self.status.value = '<b>Export error:</b> '+escape(str(exc))
+        finally:
+            self._set_busy(False)
 
     def show(self):
         # UI LOGIC: Display one workbench instance; the user explicitly applies a comparison.

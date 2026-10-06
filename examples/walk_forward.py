@@ -9,7 +9,7 @@ if RUN_WALK_FORWARD:
     from sklearn.pipeline import make_pipeline
     from sklearn.linear_model import Ridge
     from sklearn.ensemble import RandomForestRegressor
-    from model_comparison_engine import TrainableModel, WalkForwardConfig, walk_forward_compare
+    from model_comparison_engine import TrainableModel, WalkForwardConfig, TemporalConfig, walk_forward_compare
     from model_comparison_engine.demo import make_demo
 
     # CONFIGURATION LOGIC: Synthetic targets are generated for software demonstration, not a real predictive claim.
@@ -35,6 +35,8 @@ if RUN_WALK_FORWARD:
         reference=TrainableModel('Synthetic linear', reference_factory, ['measure_1', 'segment']),
         candidate=TrainableModel('Synthetic forest', candidate_factory, ['measure_1', 'measure_2', 'segment']),
         id_column='row_id', entity_column='entity_id', timezone='UTC', unit='units')
+    # CONFIGURATION LOGIC: Optional daily timing diagnostics describe held-out errors without additional fitting.
+    timing = TemporalConfig(frequency="1D", signal="bias")
     # FILE IO LOGIC: Exact folds, predictions and evidence are saved; no large table is printed.
     report_folder = result.export('reports/walk_forward_demo', slices=['segment'],
-                                   interactions=[('segment', 'category')])
+                                   interactions=[('segment', 'category')], temporal=timing)

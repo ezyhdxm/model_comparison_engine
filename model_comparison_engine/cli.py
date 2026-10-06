@@ -6,6 +6,7 @@ from pathlib import Path
 from .engine import compare_predictions
 from .slices import Slice
 from .inference import InferenceConfig
+from .temporal import TemporalConfig
 
 
 def _spec(value):
@@ -32,7 +33,9 @@ def run_config(path, output=None):
                          inference=InferenceConfig(**config.get('inference', {})),
                          include_candidate=config.get('include_candidate', True),
                          candidate_population=config.get('candidate_population', 'candidate'),
-                         candidate_top_n=config.get('candidate_top_n', 20))
+                         candidate_top_n=config.get('candidate_top_n', 20),
+                         temporal=TemporalConfig(**config['temporal']) if config.get('temporal') is not None else None,
+                         temporal_population=config.get('temporal_population'), temporal_entity=config.get('temporal_entity'))
 
 
 def main():
@@ -52,7 +55,8 @@ def main():
         result = compare_predictions(data, 'actual', 'reference_prediction', 'candidate_prediction',
             reference_name='Synthetic reference', candidate_name='Synthetic candidate',
             id_column='row_id', time_column='time', entity_column='entity_id')
-        output = result.export(args.output, slices=['segment', 'category'], interactions=[('segment', 'category')])
+        output = result.export(args.output, slices=['segment', 'category'], interactions=[('segment', 'category')],
+                               temporal=TemporalConfig())
     else:
         output = run_config(args.config, args.output)
     # UI LOGIC: Print only the report path; full tables are exported instead of filling the console.

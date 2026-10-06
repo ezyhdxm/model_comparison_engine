@@ -103,6 +103,24 @@ The returned dictionary contains `summary`, `calibration`, `residual_quantiles`,
 
 `export(..., inference=None, include_candidate=True, candidate_population="candidate", candidate_top_n=20)` includes the paired inference and candidate report by default. Set `include_candidate=False` to omit candidate outputs. CSVs provide full precision; HTML and PNGs display rounded values. The notebook Candidate tab exposes the same population choice and tables. These APIs never train, recalibrate, impute, filter by residual size, or mutate your predictions.
 
+## Optional residual timing
+
+Start with daily bias/MAE and bin support. Then review fixed-clock lag correlations and within-entity event lags; they measure different notions of adjacency. `TemporalConfig(frequency="1D")` uses fixed 24-hour UTC bins, while lag one in the event table is the next distinct timestamp for the same entity and can span a long inactive period. Inspect median/P90 elapsed gaps and consider one entity before attributing pooled correlation to persistence.
+
+```python
+# SETUP LOGIC: Optional timing analysis reuses the comparison's existing residuals.
+from model_comparison_engine import TemporalConfig
+# CONFIGURATION LOGIC: Begin with daily bins and declare the diagnostic population explicitly.
+timing = TemporalConfig(frequency="1D", signal="bias", rolling_bins=10, max_lag=20)
+# REPORTING LOGIC: Support, gaps and unavailable states accompany the exploratory calculations.
+timing_tables = comparison.temporal_diagnostics(timing, population="candidate")
+# FILE IO LOGIC: The report records this exact configuration and exports full timing tables and figures.
+folder = comparison.export("reports/timing_review", slices=["segment"],
+    temporal=timing, temporal_population="candidate")
+```
+
+The returned tables are `summary`, `series`, `autocorrelation`, `spectrum`, `change_points` and `event_autocorrelation`. Empty bins remain missing rather than zero. Spectral peaks and mean-shift candidates are descriptive, exploratory results; they do not carry calibrated significance, fix dependence in paired tests, select a model or trigger refitting. `temporal=None` in `export` omits this section. See [TIME_SERIES.md](TIME_SERIES.md) for bin weighting, support thresholds, period bounds and change-candidate interpretation.
+
 ## Fitted estimators
 
 `Model(name, estimator, features, offset=None)` wraps any fitted object with `predict`. Feature order is explicit and may differ between the two models. Predictions must contain one scalar per input record; an `(n,1)` array is accepted, multi-output arrays are rejected. A pandas prediction must preserve the exact input index. Array predictions rely on the estimator's record-order contract.
@@ -199,14 +217,15 @@ Install the `notebook` extra, open `model_comparison.ipynb`, and run its cells. 
 
 ```python
 # UI LOGIC: More than two saved models can be offered; select any two without rerunning inference.
-from model_comparison_engine import show_comparison
+from model_comparison_engine import show_comparison, TemporalConfig
 panel = show_comparison(data, actual="target",
     predictions={"Model A":"prediction_a", "Model B":"prediction_b", "Model C":"prediction_c"},
     id_column="row_id", time_column="timestamp", entity_column="entity_id",
-    default_slices=[Slice("segment"), measure], inference=InferenceConfig(), candidate_population="candidate")
+    default_slices=[Slice("segment"), measure], inference=InferenceConfig(),
+    candidate_population="candidate", temporal=TemporalConfig(frequency="1D"))
 ```
 
-Select the reference, candidate, slice column, optional second column, bins, metric and minimum record support. Set the loss, inference unit, correction, alpha and minimum independent units, plus the candidate diagnostic population. The Slices tab contains metric and significance views; the Candidate tab contains residual plots and all six diagnostic tables, including worst-slice support and error contribution. Two optional filter rows form an intersection. A filter with no condition is a no-op. Click **Apply comparison** to update results. Editing controls alone changes neither the applied result nor an export. Exports use the recorded applied model pair, filters, bins, metric, support thresholds, resolved inference settings, candidate population and top-group limit. Each comparison table remains its own correction family.
+The workbench separates data mapping and view choices from expandable inference, temporal and filter controls. A pending-edit badge distinguishes current controls from the applied review. Select the reference, candidate, slice column, optional second column, bins, metric and minimum record support. Set the loss, inference unit, correction, alpha and minimum independent units, plus the candidate diagnostic population. The Slices tab contains metric and significance views; the Candidate tab contains residual plots and all six diagnostic tables, including worst-slice support and error contribution. Enable **Include time-series diagnostics** before Apply to add the **Time series** tab; start with Daily. Passing `temporal=TemporalConfig(...)` enables and initializes those controls. The candidate population and population filters also apply to the temporal view. Two optional filter rows form an intersection. A filter with no condition is a no-op. Click **Apply comparison** to update results. Editing controls alone changes neither the applied result nor an export. Exports use the recorded applied model pair, filters, bins, metric, support thresholds, resolved inference settings, candidate population, top-group limit and enabled temporal configuration. Each comparison table remains its own correction family.
 
 The UI does not fit models. Swapping among columns reuses saved predictions. A failed Apply retains the previous successful result and identifies the error. Candidate diagnostics remain available when the chosen candidate has valid records but the reference has none. No timestamp is required; date analysis is then unavailable and automatic inference uses records.
 
@@ -224,7 +243,7 @@ Copy [examples/config.json](../examples/config.json), edit the input path and co
 python -m model_comparison_engine compare --config examples/config.json
 ```
 
-Relative input/output paths resolve beside the config. Optional `--output` is relative to the current working directory. Remove optional metadata mappings if those columns do not exist. Open the printed `report.html` path. Each export creates a new directory containing exact aggregate CSVs, complete PNG figures and `review.json` with settings, filters, coverage and a full-precision input fingerprint.
+Relative input/output paths resolve beside the config. Optional `--output` is relative to the current working directory. Remove optional metadata mappings if those columns do not exist. Open the printed `report.html` path. Each export creates a new directory containing exact aggregate CSVs, complete PNG figures and `review.json` with settings, filters, coverage and a full-precision input fingerprint. The example config enables daily temporal diagnostics; remove its `temporal` object to omit them. Charts wrap full category names and choose date ticks from the rendered label widths. Large heatmaps stack their effect/support panels, and dense category figures remain tall so labels stay readable.
 
 ## Repository contents and output labels
 

@@ -159,6 +159,7 @@ def paired_rows(data, actual, reference, candidate, *, id_column=None, time_colu
     rows['__ae_candidate'] = rows['__error_candidate'].abs()
     # TIME CONVERSION LOGIC: Missing temporal metadata does not remove otherwise evaluable predictions.
     times = local_time(rows[time_column], timezone) if time_column else pd.Series(pd.NaT, index=rows.index)
+    rows['__time'] = times
     rows['__date'], rows['__hour'] = times.dt.strftime('%Y-%m-%d'), times.dt.hour
     rows['__entity'] = rows[entity_column] if entity_column else pd.Series(pd.NA, index=rows.index)
     # CORE LOGIC: STEP 4 — Report coverage against the complete supplied evaluation population.
@@ -207,6 +208,7 @@ def candidate_rows(data, actual, candidate, *, time_column=None, entity_column=N
     rows['__ae_candidate'] = rows['__error_candidate'].abs()
     # TIME CONVERSION LOGIC: Missing date/entity values remain visible and never remove an evaluable error.
     times = local_time(rows[time_column], timezone) if time_column else pd.Series(pd.NaT, index=rows.index)
+    rows['__time'] = times
     rows['__date'], rows['__hour'] = times.dt.strftime('%Y-%m-%d'), times.dt.hour
     rows['__entity'] = rows[entity_column] if entity_column else pd.Series(pd.NA, index=rows.index)
     return rows

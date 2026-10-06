@@ -7,22 +7,27 @@
 
 # %%
 # SETUP LOGIC: Synthetic inputs exercise the same API as real evaluation records.
-from model_comparison_engine import compare_predictions, show_comparison, Slice, InferenceConfig
+from model_comparison_engine import compare_predictions, show_comparison, Slice, InferenceConfig, TemporalConfig
 from model_comparison_engine.demo import make_demo
 from model_comparison_engine.inference_plots import significance_heatmap
 from model_comparison_engine.diagnostic_plots import candidate_figure, worst_slices_figure
+from model_comparison_engine.temporal_plots import temporal_figure, event_lag_figure
 
 # CONFIGURATION LOGIC: Reproducible demonstration only; these results are not real-world performance evidence.
-data = make_demo(n=1200, seed=2026)
+data = make_demo(n=3840, seed=2026)
 predictions = {"Synthetic reference": "reference_prediction", "Synthetic candidate": "candidate_prediction"}
 inference = InferenceConfig(loss="absolute", unit="auto", correction="by", alpha=.05, min_units=10)
+# CONFIGURATION LOGIC: Forty synthetic dates allow daily temporal review without asserting a real signal.
+timing = TemporalConfig(frequency="1D", signal="bias", rolling_bins=10, max_lag=20)
 
 # %% [markdown]
 # ## Inspect and compare
 #
 # Choose model roles, metadata slices, numerical bins, interactions and statistical settings. Auto uses equally weighted date means when time is configured, otherwise records. Explicit record, date and entity units are available. Negative t favors the candidate; absolute and squared loss are supported. Both minimum records and minimum units must pass.
 #
-# Apply freezes the pair, filters, bins, test settings and candidate population. Editing controls changes the next Apply; exports preserve the last applied choices. Open Slices → Significance for tests, and Candidate for residual plots, calibration, quantiles, weakest slices and worst cases. UTC and generic units are defaults, not assumptions about your own data.
+# The v0.4 workbench groups setup into sections, shows a pending-edit badge and wraps long chart labels. Expand the optional time-series controls to change the daily interval, signal and support.
+#
+# Apply freezes the pair, filters, bins, test settings, candidate population and enabled temporal configuration. Editing controls changes the next Apply; exports preserve the last applied choices. Open Slices → Significance for tests, Candidate for residual plots, and Time series for the enabled timing diagnostics. UTC and generic units are defaults, not assumptions about your own data.
 
 # %%
 # CONFIGURATION LOGIC: Caller-defined defaults contain no industry-specific fields or business thresholds.
@@ -31,7 +36,7 @@ measure = Slice("measure_1", [float("-inf"),0,1,float("inf")], right=False)
 panel = show_comparison(data, actual="actual", predictions=predictions,
     id_column="row_id", time_column="time", entity_column="entity_id",
     default_slices=[Slice("segment"), measure], unit="units", timezone="UTC",
-    inference=inference, candidate_population="candidate")
+    inference=inference, candidate_population="candidate", temporal=timing)
 # UI LOGIC: Apply the initial declared choices once; subsequent edits require another explicit Apply.
 panel.run()
 
@@ -87,6 +92,22 @@ candidate_plot = candidate_figure(candidate_rows, diagnostics, name=comparison.c
 weakest_slice_plot = worst_slices_figure(diagnostics["worst_slices"], unit=comparison.unit)
 
 # %% [markdown]
+# ## Optional residual timing
+#
+# Begin with daily bias/MAE, the trailing mean and bin support. Fixed-clock lags preserve elapsed gaps; within-entity event lag one means the next distinct timestamp for that entity, which may be hours or days later. Check median/P90 event gaps before interpreting persistence, and inspect one entity when pooled composition obscures the pattern.
+#
+# Spectral peaks and offline mean-shift candidates are descriptive, exploratory results. They have no calibrated significance and do not refit a model or repair independence assumptions in the paired tests. Empty bins remain missing. See [Residual timing](docs/TIME_SERIES.md) for the two clocks, support rules and interpretation.
+
+# %%
+# REPORTING LOGIC: Existing candidate residuals supply every timing table; all rows retain their original predictions.
+timing_tables = comparison.temporal_diagnostics(timing, population=candidate_population)
+# REPORTING LOGIC: A fixed-entity view isolates that entity's event gaps and error pattern.
+one_entity_timing = comparison.temporal_diagnostics(timing, population=candidate_population, entity="entity_00")
+# PLOTTING LOGIC: Elapsed-time bins and within-entity event lags are shown in separate figures.
+clock_plot = temporal_figure(timing_tables, name=comparison.candidate_name, unit=comparison.unit)
+event_plot = event_lag_figure(timing_tables["event_autocorrelation"], name=comparison.candidate_name)
+
+# %% [markdown]
 # ## Reproducible exports
 #
 # Exact tables remain in variables until displayed. Exported reports contain complete figures, full-precision tables, support counts, inference settings and population provenance. Each export creates a new review directory. The UI export uses its applied state; the API export below uses the explicit configuration in this cell.
@@ -95,7 +116,8 @@ weakest_slice_plot = worst_slices_figure(diagnostics["worst_slices"], unit=compa
 # FILE IO LOGIC: Save the chosen statistical policy and diagnostic population with every review artifact.
 report_folder = comparison.export("reports/notebook_demo", slices=["segment",measure],
     interactions=[("segment","category")], min_count=30, inference=inference,
-    include_candidate=True, candidate_population=candidate_population, candidate_top_n=20)
+    include_candidate=True, candidate_population=candidate_population, candidate_top_n=20,
+    temporal=timing, temporal_population=candidate_population)
 
 # %% [markdown]
 # ## Bring your own inputs

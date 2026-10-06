@@ -124,6 +124,34 @@ class Comparison:
         tables['summary']['population'] = population
         return tables
 
+    def temporal_diagnostics(self, settings=None, *, population='candidate', entity=None):
+        """Describe residual timing using fixed-clock bins and separate within-entity event lags."""
+        # CONFIGURATION LOGIC: Time diagnostics are explicit, use existing predictions, and fit no forecasting model.
+        from .temporal import TemporalConfig, temporal_tables
+        from .event_lags import event_lag_table
+        settings = TemporalConfig() if settings is None else settings
+        if isinstance(settings, dict):
+            settings = TemporalConfig(**settings)
+        if not isinstance(settings, TemporalConfig):
+            raise TypeError('settings must be TemporalConfig, a configuration dict or None.')
+        if entity is not None and self.config['entity_column'] is None:
+            raise ValueError('Map entity_column before selecting one temporal entity.')
+        # CORE LOGIC: STEP 1 — Restrict the diagnostic series to one explicit entity when requested.
+        # Input: entities=['A','B','A'], residuals=[1,9,3], entity='A'.
+        # Output: retained entities=['A','A'], residuals=[1,3]; the B prediction is absent from both temporal clocks.
+        # Explanation: A single-entity review can separate residual persistence from changing entity composition.
+        # Trick: Filtering affects this diagnostic only; the parent paired comparison and original predictions stay intact.
+        rows = self.candidate_rows(population)
+        rows = rows.loc[rows['__entity'].eq(entity)].copy() if entity is not None else rows
+        # DIAGNOSTIC LOGIC: Both clocks reuse the selected errors and retain their own explicit support audits.
+        tables = temporal_tables(rows, settings)
+        tables['event_autocorrelation'] = event_lag_table(rows, settings.max_lag, settings.signal)
+        # REPORTING LOGIC: Preserve population identity with temporal evidence and exported settings.
+        tables['summary']['population'] = population
+        tables['summary']['entity_filter'] = str(entity) if entity is not None else '(all selected entities)'
+        tables['summary']['entities_in_population'] = rows['__entity'].nunique()
+        return tables
+
     def filter(self, column, *, minimum=None, maximum=None, values=None, include_missing=False,
                minimum_inclusive=True, maximum_inclusive=True):
         # VALIDATION LOGIC: Filters are explicit conditions, never evaluated as Python expressions.
@@ -174,12 +202,14 @@ class Comparison:
         return pd.DataFrame({'column':counts.index,'missing_n':counts.values,'missing_pct':counts.values/max(len(self.data),1)*100})
 
     def export(self, folder, slices=None, interactions=None, min_count=30, metric='mae_delta', *,
-               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20):
+               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20,
+               temporal=None, temporal_population=None, temporal_entity=None):
         # FILE IO LOGIC: Export a new immutable review directory; never overwrite model artifacts.
         from .report import export_comparison
         return export_comparison(self, folder, slices, interactions, min_count, metric,
                                  inference=inference, include_candidate=include_candidate,
-                                 candidate_population=candidate_population, candidate_top_n=candidate_top_n)
+                                 candidate_population=candidate_population, candidate_top_n=candidate_top_n,
+                                 temporal=temporal, temporal_population=temporal_population, temporal_entity=temporal_entity)
 
 
 def compare_predictions(data, actual, reference, candidate, *, reference_name=None, candidate_name=None,
