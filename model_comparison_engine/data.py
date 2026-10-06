@@ -135,7 +135,7 @@ def paired_rows(data, actual, reference, candidate, *, id_column=None, time_colu
         b = b + numeric(frame, candidate_offset)
     # CORE LOGIC: STEP 2 — Form a single common finite mask for the comparison.
     # Input: truth=[10,10,10,NaN], a=[11,NaN,11,11], b=[10,9,NaN,10].
-    # Output: target_ok=[True,True,True,False], paired=[True,False,False,False].
+    # Output: target_ok=[True,True,True,False], paired=[True,False,False,False], retained source position/index=[0].
     # Explanation: Row 1 alone has all three finite values; neither model gets a different denominator.
     # Trick: Missing predictions and overflowed differences are coverage gaps, never filled with zero.
     target_ok = np.isfinite(truth)
@@ -145,6 +145,7 @@ def paired_rows(data, actual, reference, candidate, *, id_column=None, time_colu
     finite_errors = np.isfinite(error_a) & np.isfinite(error_b)
     paired = target_ok & a_ok & b_ok & finite_errors
     rows = frame.loc[paired].copy().reset_index(drop=True)
+    rows['__source_position'], rows['__source_index'] = np.flatnonzero(paired), frame.index[paired].to_numpy()
     # CORE LOGIC: STEP 3 — Materialize signed and absolute errors on those same rows.
     # Input: truth=[1], a=[1.02], b=[.99], error_scale=100.
     # Output: reference_error≈[2], candidate_error≈[-1], absolute_errors≈[2],[1] (floating point).
@@ -169,4 +170,43 @@ def paired_rows(data, actual, reference, candidate, *, id_column=None, time_colu
     coverage.update(reference_available=int((target_ok & a_ok).sum()), candidate_available=int((target_ok & b_ok).sum()))
     coverage.update(excluded=len(frame)-len(rows), missing_time=int(times.isna().sum()))
     coverage['nonfinite_error_rows'] = int((target_ok & a_ok & b_ok & ~finite_errors).sum())
+    # CORE LOGIC: STEP 5 — Separate prediction availability from finite, independently evaluable errors.
+    # Input: valid target=[T,T], reference error=[NaN,2], candidate error=[1,3], paired=1.
+    # Output: reference_evaluable=1, candidate_evaluable=2, candidate_only_evaluable=1.
+    # Explanation: Candidate row 0 belongs in standalone diagnosis despite its missing reference error.
+    # Trick: Finite predictions can overflow during subtraction/scaling; availability alone is insufficient.
+    coverage['reference_evaluable'] = int((target_ok & a_ok & np.isfinite(error_a)).sum())
+    coverage['candidate_evaluable'] = int((target_ok & b_ok & np.isfinite(error_b)).sum())
+    coverage['candidate_only_evaluable'] = coverage['candidate_evaluable']-coverage['paired']
     return rows, coverage
+
+
+def candidate_rows(data, actual, candidate, *, time_column=None, entity_column=None,
+                   error_scale=1., timezone='UTC', candidate_offset=None):
+    """Prepare independently evaluable candidate rows from an already validated comparison input."""
+    # CORE LOGIC: STEP 1 — Restore the candidate level and compute its error without a reference mask.
+    # Input: actual=[10,10,10], prediction=[1,2,3], offset=[10,10,NaN], error_scale=100.
+    # Output: truth=[10,10,10], prediction=[11,12,NaN], errors=[100,200,NaN].
+    # Explanation: A residual prediction needs its own offset once, before errors are converted to display units.
+    # Trick: Float64 conversion happens before arithmetic; nonfinite arithmetic remains an explicit coverage gap.
+    truth, prediction = numeric(data, actual), numeric(data, candidate)
+    if candidate_offset is not None:
+        prediction = prediction + numeric(data, candidate_offset)
+    with np.errstate(over='ignore', invalid='ignore'):
+        errors = (prediction-truth)*error_scale
+    # CORE LOGIC: STEP 2 — Keep every finite candidate error, including records with no reference prediction.
+    # Input: truth=[10,10,10], prediction=[11,12,NaN], errors=[100,200,NaN], reference=[NaN,13,13].
+    # Output: source positions/indices=[0,1], __actual=[10,10], __candidate=[11,12], __ae_candidate=[100,200].
+    # Explanation: Missing reference on row 0 cannot hide a valid candidate prediction from its own diagnosis.
+    # Trick: Convert selected values to arrays when resetting the index to prevent pandas label realignment.
+    valid = np.isfinite(truth) & np.isfinite(prediction) & np.isfinite(errors)
+    rows = data.loc[valid].copy().reset_index(drop=True)
+    rows['__source_position'], rows['__source_index'] = np.flatnonzero(valid), data.index[valid].to_numpy()
+    rows['__actual'], rows['__candidate'] = truth.loc[valid].to_numpy(), prediction.loc[valid].to_numpy()
+    rows['__error_candidate'] = errors.loc[valid].to_numpy()
+    rows['__ae_candidate'] = rows['__error_candidate'].abs()
+    # TIME CONVERSION LOGIC: Missing date/entity values remain visible and never remove an evaluable error.
+    times = local_time(rows[time_column], timezone) if time_column else pd.Series(pd.NaT, index=rows.index)
+    rows['__date'], rows['__hour'] = times.dt.strftime('%Y-%m-%d'), times.dt.hour
+    rows['__entity'] = rows[entity_column] if entity_column else pd.Series(pd.NA, index=rows.index)
+    return rows

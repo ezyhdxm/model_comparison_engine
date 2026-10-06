@@ -8,8 +8,10 @@ import ipywidgets as w
 from IPython.display import display
 from .data import read_data
 from .engine import Comparison, compare_predictions
+from .inference import InferenceConfig
+from .diagnostics import candidate_tables
 from .slices import Slice, default_slices
-from . import plots
+from . import plots, inference_plots, diagnostic_plots
 
 
 def _edges(text):
@@ -37,6 +39,13 @@ def _preview(table):
     return w.HTML(note+'<div style="max-height:420px;overflow:auto">'+shown.to_html(index=False,escape=True,float_format=lambda x:f'{x:.5g}')+'</div>')
 
 
+def _table(table, title):
+    # UI LOGIC: Keep full precision in public tables while bounding the notebook's visible records.
+    shown = table.head(100)
+    note = f'<h4>{escape(title)}</h4><p>Showing {len(shown):,} of {len(table):,} rows.</p>'
+    return w.HTML(note+'<div style="max-height:420px;overflow:auto">'+shown.to_html(index=False,escape=True,float_format=lambda x:f'{x:.5g}')+'</div>')
+
+
 def _filter_text(condition):
     # UI LOGIC: Present the recorded population in readable terms instead of a Python configuration dict.
     column, parts = condition['column'], []
@@ -54,7 +63,8 @@ class ComparisonPanel:
     # UI LOGIC: Input edits do not alter the applied comparison or exported results until Apply succeeds.
     def __init__(self, data=None, *, actual=None, predictions=None, id_column=None, time_column=None,
                  entity_column=None, error_scale=1, unit='units', timezone='UTC',
-                 default_slices=None, tolerance=1, reference_offset=None, candidate_offset=None):
+                 default_slices=None, tolerance=1, reference_offset=None, candidate_offset=None,
+                 inference=None, candidate_population='candidate'):
         self.result, self.applied_specs, self.busy = None, None, False
         self.supplied_slices = default_slices
         self.prediction_mapping = predictions
@@ -88,6 +98,18 @@ class ComparisonPanel:
         self.minimum = w.BoundedIntText(value=30,min=1,max=100000000,description='Minimum N:')
         self.top_n = w.BoundedIntText(value=20,min=1,max=50,description='Top groups:')
         self.metric = w.Dropdown(options=[(label,key) for key,label in plots.METRICS.items()],description='Metric:',layout=w.Layout(width='470px'))
+        # UI LOGIC: Inference choices are pending until Apply snapshots them with the population and slices.
+        inference = inference or InferenceConfig()
+        if isinstance(inference,dict):
+            inference = InferenceConfig(**inference)
+        self.loss = w.Dropdown(options=[('Absolute error','absolute'),('Squared error','squared')],value=inference.loss,description='Test loss:')
+        self.test_unit = w.Dropdown(options=[('Auto: date if supplied','auto'),('Record','record'),('Date','date'),('Entity','entity')],
+                                    value=inference.unit,description='Test unit:')
+        self.correction = w.Dropdown(options=[('BY (dependent tests)','by'),('BH','bh'),('None','none')],value=inference.correction,description='Correction:')
+        self.alpha = w.BoundedFloatText(value=inference.alpha,min=.000001,max=.999999,step=.01,description='Alpha:')
+        self.min_units = w.BoundedIntText(value=inference.min_units,min=2,max=100000000,description='Min units:')
+        self.candidate_population = w.Dropdown(options=[('All valid candidate records','candidate'),('Paired records only','paired')],
+                                              value=candidate_population,description='Candidate:',layout=w.Layout(width='420px'))
         self.filters = [self.make_filter(),self.make_filter()]
         self.offset_mapping = {}
         self.apply = w.Button(description='Apply comparison',button_style='primary')
@@ -105,8 +127,12 @@ class ComparisonPanel:
         options.set_title(0,'Data and prediction columns')
         controls = w.VBox([w.HBox([self.first,self.second]),w.HBox([self.first_bins,self.first_right]),
                            w.HBox([self.second_bins,self.second_right]),w.HBox([self.minimum,self.top_n,self.metric])])
+        inference_controls = w.VBox([w.HBox([self.loss,self.test_unit,self.correction]),w.HBox([self.alpha,self.min_units]),
+                                     w.HTML('Two-sided paired mean loss tests. Negative t favors the candidate. Date/entity means receive equal weight; '
+                                            'minimum records and minimum units must both pass. Each table is a separate correction family.'),
+                                     self.candidate_population])
         self.widget = w.VBox([w.HTML('<h3>Compare two models</h3><p>Choose a reference, candidate and slices. Negative error delta means improvement. Units must match before comparison.</p>'),
-                              options,controls,w.HTML('<b>Optional population filters</b> · two rows form an intersection; blank = no restriction'),
+                              options,controls,inference_controls,w.HTML('<b>Optional population filters</b> · two rows form an intersection; blank = no restriction'),
                               *[item['widget'] for item in self.filters],self.apply,self.status,self.applied,self.views,
                               w.HBox([self.export_path,self.export_button])])
         self.first.observe(lambda _:self.set_bins(self.first,self.first_bins,self.first_right),names='value')
@@ -199,6 +225,59 @@ class ComparisonPanel:
         labels = original.labels if same_bins and right.value == original.right else None
         return Slice(selector.value,bins,labels,right.value,top_n)
 
+    def paired_views(self, result, first, second, inference, min_count, metric, title):
+        # UI LOGIC: A missing reference must not hide the candidate's independently valid records.
+        if result.rows.empty:
+            return [w.HTML('No paired finite records in the applied population.') for _ in range(3)]
+        # REPORTING LOGIC: Each significance table uses the same records and declared slices as its paired metrics.
+        overall = result.paired_test(inference=inference,min_count=min_count)
+        table = result.cross_slice(first,second,min_count=min_count) if second else result.slice(first,min_count=min_count)
+        tested = (result.cross_slice_test(first,second,inference=inference,min_count=min_count) if second else
+                  result.slice_test(first,inference=inference,min_count=min_count))
+        resolved_unit = result.inference_config(inference).unit
+        # PLOTTING LOGIC: Keep the effect-size chart next to statistical evidence and the support needed to interpret it.
+        chart = plots.heatmap(table,metric,unit=result.unit,title=title) if second else plots.slice_figure(table,metric,unit=result.unit,title=title)
+        significance = inference_plots.significance_heatmap(tested,title=title,unit_label=result.unit)
+        loss_unit = result.unit if inference.loss == 'absolute' else f'{result.unit} squared'
+        note = w.HTML(f'<p>Two-sided mean {escape(inference.loss)} loss difference ({escape(loss_unit)}); '
+                      f'equal weight per {escape(resolved_unit)}. Correction: {inference.correction.upper()}, alpha={inference.alpha:g}. '
+                      'Stars show adjusted q thresholds: * ≤ .05, ** ≤ .01, *** ≤ .001; the significant column uses alpha. '
+                      '† marks low support. Zero/near-zero variance has no test or stars. '
+                      'Intervals are pointwise, not multiplicity-adjusted. No stars does not establish equivalence.</p>')
+        slices = w.Tab(children=[w.VBox([_image(chart),_preview(table)]),w.VBox([note,_image(significance),_table(tested,'Paired tests')])])
+        slices.set_title(0,'Error metrics')
+        slices.set_title(1,'Significance')
+        coverage_note = w.HTML('<p><b>Paired</b> means the same records have a finite actual, both reconstructed predictions '
+                               'and both scaled errors. Model comparison uses only these common records. '
+                               f'Independently evaluable: reference {result.coverage["reference_evaluable"]:,}; '
+                               f'candidate {result.coverage["candidate_evaluable"]:,}.</p>')
+        return [w.VBox([_image(plots.overview(result)),coverage_note,_table(overall,'Overall paired test')]),slices,
+                w.VBox([_image(plots.daily_figure(result.daily(),unit=result.unit)),_table(result.stability(),'Leave-one-date-out sensitivity')])]
+
+    def candidate_view(self, result, first, second, population, min_count, top_n):
+        # REPORTING LOGIC: Candidate diagnostics choose their own explicit population and never use reference errors.
+        rows = result.candidate_rows(population=population)
+        specs = [first,second] if second else [first]
+        tables = candidate_tables(rows, specs, min_count=min_count, top_n=top_n,
+                                  tolerance=result.tolerance, id_column=result.config['id_column'])
+        tables['summary']['population'] = population
+        # UI LOGIC: Show population counts before any residual figure to prevent an accidental unequal-sample comparison.
+        description = 'all valid candidate records' if population == 'candidate' else 'paired records only'
+        note = w.HTML(f'<p><b>{escape(result.candidate_name)}:</b> {len(rows):,} records ({description}); '
+                      f'paired comparison: {len(result.rows):,} records; supplied after filters: {len(result.data):,}. '
+                      'Candidate and paired metrics are directly comparable only when they use the same records. '
+                      'Positive residual means overprediction. Worst cases and slices are descriptive rankings.</p>')
+        figure = diagnostic_plots.candidate_figure(rows,tables,name=result.candidate_name,unit=result.unit,error_scale=result.config['error_scale'])
+        labels = [('summary','Summary'),('calibration','Calibration'),('residual_quantiles','Residual quantiles'),
+                  ('worst_slices','Worst slices'),('worst_cases','Worst cases'),('daily','Dates')]
+        detail_views = [_table(tables[key],label) for key,label in labels]
+        weakest = diagnostic_plots.worst_slices_figure(tables['worst_slices'],unit=result.unit,title=f'{result.candidate_name}: weakest slices')
+        detail_views[3] = w.VBox([_image(weakest),detail_views[3]])
+        details = w.Tab(children=detail_views)
+        for index,(_,label) in enumerate(labels):
+            details.set_title(index,label)
+        return w.VBox([note,_image(figure),details])
+
     def run(self, _=None):
         # UI LOGIC: Publish result state only after a successful computation; previous exports remain valid.
         if self.busy:
@@ -225,24 +304,34 @@ class ComparisonPanel:
                                    minimum_inclusive=not item['strict'].value)
                     result = result.filter(item['column'].value,**options)
                     filters.append(dict(column=item['column'].value,**options))
-            if result.rows.empty:
-                raise ValueError(f'No common finite rows in this population. Coverage: {result.coverage}')
             first,second = self.specs()
-            table = result.cross_slice(first,second,min_count=self.minimum.value) if second else result.slice(first,min_count=self.minimum.value)
+            # CONFIGURATION LOGIC: Copy all pending analysis choices before constructing any new displayed result.
+            inference = InferenceConfig(loss=self.loss.value,unit=self.test_unit.value,correction=self.correction.value,
+                                        alpha=self.alpha.value,min_units=self.min_units.value)
+            inference = result.inference_config(inference)
+            population,min_count,metric = self.candidate_population.value,self.minimum.value,self.metric.value
+            candidate_count = result.coverage['candidate_evaluable'] if population == 'candidate' else len(result.rows)
+            if not candidate_count and result.rows.empty:
+                raise ValueError(f'No finite candidate records in the selected diagnostic population. Coverage: {result.coverage}')
             title = f'{candidate} vs {reference} | {first.column}'+(f' × {second.column}' if second else '')
-            chart = plots.heatmap(table,self.metric.value,unit=result.unit,title=title) if second else plots.slice_figure(table,self.metric.value,unit=result.unit,title=title)
-            self.views.children = [_image(plots.overview(result)),w.VBox([_image(chart),_preview(table)]),
-                                   w.VBox([_image(plots.daily_figure(result.daily(),unit=result.unit)),w.HTML(result.stability().to_html(index=False,escape=True))]),
-                                   w.HTML(result.missingness().to_html(index=False,escape=True))]
-            for i,label in enumerate(['Overview','Slices','Dates','Missingness']):
+            views = self.paired_views(result,first,second,inference,min_count,metric,title)
+            views += [self.candidate_view(result,first,second,population,min_count,self.top_n.value),_table(result.missingness(),'Input missingness')]
+            # UI LOGIC: Publish the complete view and its matching export state only after every calculation succeeds.
+            self.views.children = views
+            for i,label in enumerate(['Overview','Slices','Dates','Candidate','Missingness']):
                 self.views.set_title(i,label)
             self.result,self.applied_specs = result,(first,second)
-            self.applied_filters,self.applied_min_count = result.filter_history,self.minimum.value
-            self.applied_metric = self.metric.value
+            self.applied_filters,self.applied_min_count = result.filter_history,min_count
+            self.applied_metric,self.applied_inference = metric,inference
+            self.applied_candidate_population = population
+            self.applied_top_n = self.top_n.value
             self.export_button.disabled = False
-            population = '; '.join(_filter_text(f) for f in result.filter_history) or 'All supplied records'
-            self.applied.value = '<b>Applied:</b> '+escape(title)+f' | {len(result.rows):,} paired records<br><b>Population:</b> '+escape(population)
-            self.status.value = 'Ready. Controls affect the next Apply. Export always uses the applied result. Low N is flagged; date sensitivity is descriptive.'
+            filters_text = '; '.join(_filter_text(f) for f in result.filter_history) or 'All supplied records'
+            self.applied.value = ('<b>Applied:</b> '+escape(title)+f' | {len(result.rows):,} paired records<br><b>Population:</b> '+escape(filters_text)+
+                                  f'<br><b>Inference:</b> {inference.loss}, unit={inference.unit}, {inference.correction.upper()}, '
+                                  f'alpha={inference.alpha:g}, minimum records={min_count}, minimum units={inference.min_units}; '
+                                  f'<b>Candidate population:</b> {population}')
+            self.status.value = 'Ready. Controls affect the next Apply. Export uses the applied choices. Dependence across dates and repeated exploration still require care.'
         except Exception as exc:
             self.status.value = '<b>Comparison error:</b> '+escape(str(exc))+' Previous applied result is unchanged.'
         finally:
@@ -255,7 +344,8 @@ class ComparisonPanel:
         try:
             first,second = self.applied_specs
             output = self.result.export(self.export_path.value,slices=[first],interactions=[(first,second)] if second else [],
-                                        min_count=self.applied_min_count,metric=self.applied_metric)
+                                        min_count=self.applied_min_count,metric=self.applied_metric,inference=self.applied_inference,
+                                        include_candidate=True,candidate_population=self.applied_candidate_population,candidate_top_n=self.applied_top_n)
             self.status.value = 'Saved complete PNG, CSV and HTML review to '+escape(str(output))
         except Exception as exc:
             self.status.value = '<b>Export error:</b> '+escape(str(exc))

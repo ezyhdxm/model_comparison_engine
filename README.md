@@ -1,6 +1,6 @@
 # Model Comparison Engine
 
-Compare **any two scalar regression models** on the same evaluation records. Start with prediction columns, or pass two fitted estimators and their respective feature lists. Inspect overall errors, arbitrary one-column slices, two-column heatmaps, missingness, coverage and date sensitivity. Export calculated HTML, CSV and complete PNG reports.
+Compare **any two scalar regression models** on the same evaluation records. Start with prediction columns, or pass two fitted estimators and their respective feature lists. Inspect overall errors, arbitrary slices, two-column heatmaps, paired statistical evidence, candidate residuals, coverage and date sensitivity. Export calculated HTML, CSV and complete PNG reports.
 
 The package is independent of a particular dataset, industry, estimator library or training pipeline. It has no hardcoded business fields or thresholds. All shipped examples are generated synthetic data; no private records, models or historical result artifacts are included.
 
@@ -17,7 +17,7 @@ Open [model_comparison.ipynb](model_comparison.ipynb) for the interactive workfl
 
 ```python
 # CONFIGURATION LOGIC: These are user-defined column names; the engine imposes no data-specific schema.
-from model_comparison_engine import compare_predictions, Slice, show_comparison
+from model_comparison_engine import compare_predictions, InferenceConfig, Slice, show_comparison
 
 # REPORTING LOGIC: Both predictions are scored on the same finite target/prediction records.
 comparison = compare_predictions(
@@ -27,17 +27,28 @@ comparison = compare_predictions(
     id_column="row_id", time_column="timestamp", entity_column="entity_id",
     unit="units", timezone="UTC",
 )
-# UI LOGIC: Choose columns, filters, numerical bins and interactions, then Apply.
-panel = show_comparison(comparison)
+# CONFIGURATION LOGIC: Auto uses date means when timestamps are configured, otherwise individual records.
+inference = InferenceConfig(loss="absolute", unit="auto", correction="by", alpha=.05, min_units=10)
+# REPORTING LOGIC: Reuse existing errors; each returned table is its own multiple-testing family.
+paired_evidence = comparison.paired_test(inference=inference, min_count=30)
+slice_evidence = comparison.cross_slice_test("segment", "category", inference=inference, min_count=30)
+candidate_diagnostics = comparison.candidate_diagnostics(slices=["segment"], population="candidate")
+# UI LOGIC: Choose columns, filters, bins, test settings and candidate population, then Apply.
+panel = show_comparison(comparison, inference=inference, candidate_population="candidate")
 # FILE IO LOGIC: Exact tables and complete figures are saved without printing a large table.
 report_folder = comparison.export(
     "reports",
     slices=["segment", Slice("measure_1", [0,10,20,float("inf")], right=False)],
     interactions=[("segment", "category")],
+    inference=inference, include_candidate=True, candidate_population="candidate",
 )
 ```
 
 Only target and two prediction columns are required. Record ID, timestamp and entity ID are optional metadata. An entity may have repeated records; it is distinct from a unique record ID. Default error units are `units`, and timezone is UTC. Add any column to your input for a new slice.
+
+Paired tests use **candidate loss minus reference loss**, so a negative effect and t-statistic favor the candidate. Choose absolute or squared error, and record, date or entity units. Date/entity units first average losses within each unit and then receive equal weight. The default Benjamini–Yekutieli (BY) correction adjusts supported tests within each table; BH and unadjusted alternatives are explicit options. Stars indicate adjusted significance, and † marks insufficient support. Constant or near-constant differences receive no test or stars. [USAGE.md](docs/USAGE.md#paired-statistical-evidence) explains counts, assumptions and confidence intervals.
+
+Candidate diagnostics default to all finite target/candidate-error records, including records with a missing reference. Their population can differ from the paired comparison: inspect the displayed counts or choose `population="paired"` for the same records. Residual plots, calibration, quantiles, worst slices/cases and dates describe candidate behavior without retraining or removing outliers. Non-significance does not establish equivalence; date grouping and out-of-fold predictions do not resolve serial correlation or repeated model selection.
 
 ## Two fitted estimators
 
@@ -60,6 +71,8 @@ comparison = compare_models(
 - Explicit prediction coverage, finite-error checks, missing metadata groups and low-support flags.
 - Arbitrary categorical slices and fixed numerical bins; missing and out-of-range values remain separate.
 - Two-column metric and sample-count heatmaps; population filters compose by intersection.
+- Paired mean loss tests with record/date/entity units, confidence intervals, BY/BH correction and explicit unsupported states.
+- Candidate-only error distribution, actual-versus-predicted calibration, residual quantiles and worst slices/cases, with an explicit population.
 - Any saved model pair as reference/candidate; model names carry no special benchmark status.
 - Identity-based prediction joins and explicit stage selection for long prediction tables.
 - Optional per-model additive offsets when predictions are relative to a known reference value.

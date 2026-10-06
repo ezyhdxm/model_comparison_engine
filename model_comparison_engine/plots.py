@@ -25,7 +25,12 @@ def overview(comparison):
             if np.isfinite(value):
                 ax.annotate(f'{value:.4g}', (i,value), xytext=(0,4), textcoords='offset points', ha='center')
     counts = comparison.coverage
-    axes[2].bar(['Supplied','Valid target','Paired'], [counts[k] for k in ['total','valid_target','paired']], color='#426b81')
+    labels = ['Supplied','Valid target','Reference','Candidate','Paired']
+    keys = ['total','valid_target','reference_evaluable','candidate_evaluable','paired']
+    axes[2].bar(labels, [counts[k] for k in keys], color=['#657987']*4+['#187f83'])
+    for i,key in enumerate(keys):
+        axes[2].annotate(f'{counts[key]:,}', (i,counts[key]), xytext=(0,4), textcoords='offset points', ha='center', fontsize=8)
+    axes[2].tick_params(axis='x',rotation=35)
     axes[2].set(title='Evaluation coverage', ylabel='Records')
     fig.suptitle(f'{comparison.candidate_name} vs {comparison.reference_name} | {counts["paired"]:,} paired records')
     return fig
@@ -36,7 +41,7 @@ def slice_figure(table, metric='mae_delta', *, unit='units', title='Slice compar
     height = min(24, max(4, len(table)*.3+1.8))
     fig = Figure(figsize=(12,height), constrained_layout=True)
     ax, support = fig.subplots(1,2, gridspec_kw={'width_ratios':[3,1]})
-    labels = [str(v)+(' *' if small else '') for v,small in zip(table['group'],table['low_support'])]
+    labels = [str(v)+(' †' if small else '') for v,small in zip(table['group'],table['low_support'])]
     y = np.arange(len(table))
     values = table[metric].to_numpy(dtype=float)
     beneficial = values >= 0 if metric == 'mae_improvement_pct' else values <= 0
@@ -48,7 +53,7 @@ def slice_figure(table, metric='mae_delta', *, unit='units', title='Slice compar
     support.set(yticks=y,yticklabels=[],title='Paired records',xlabel='N')
     ax.invert_yaxis()
     support.invert_yaxis()
-    fig.suptitle(title+'\n* below minimum support; negative error delta = improvement')
+    fig.suptitle(title+'\n† below minimum support; negative error delta = improvement')
     return fig
 
 
@@ -78,13 +83,13 @@ def heatmap(table, metric='mae_delta', *, unit='units', title='Two-column compar
     for i in range(len(xs)):
         for j in range(len(ys)):
             if np.isfinite(values[i,j]):
-                star = '*' if low.iloc[i,j] else ''
-                axes[0].text(j,i,f'{values[i,j]:.3g}{star}',ha='center',va='center',fontsize=8,
+                marker = '†' if low.iloc[i,j] else ''
+                axes[0].text(j,i,f'{values[i,j]:.3g}{marker}',ha='center',va='center',fontsize=8,
                              color='white' if abs(values[i,j]) > .55*bound else 'black')
             if np.isfinite(counts.iloc[i,j]):
                 axes[1].text(j,i,f'{counts.iloc[i,j]:,.0f}',ha='center',va='center',fontsize=8,
                              color='white' if images[1].norm(counts.iloc[i,j]) > .55 else 'black')
-    fig.suptitle(title+f' | {"%" if metric.endswith("pct") else unit}\n* below minimum support; blank = undefined / unavailable metric; see N')
+    fig.suptitle(title+f' | {"%" if metric.endswith("pct") else unit}\n† below minimum support; blank = undefined / unavailable metric; see N')
     return fig
 
 

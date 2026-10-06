@@ -36,11 +36,14 @@ class WalkForwardResult:
     fold_metrics: pd.DataFrame
     configuration: dict
 
-    def export(self, folder, *, slices=None, interactions=None, min_count=30, metric='mae_delta'):
+    def export(self, folder, *, slices=None, interactions=None, min_count=30, metric='mae_delta',
+               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20):
         """Export the ordinary paired review plus fold boundaries, exact OOF rows and fold metrics."""
         # FILE IO LOGIC: Extend the newly created immutable review directory; estimator objects are not serialized.
         output = self.comparison.export(folder, slices=slices, interactions=interactions,
-                                        min_count=min_count, metric=metric)
+                                        min_count=min_count, metric=metric, inference=inference,
+                                        include_candidate=include_candidate, candidate_population=candidate_population,
+                                        candidate_top_n=candidate_top_n)
         self.folds.to_csv(output/'folds.csv', index=False)
         self.fold_metrics.to_csv(output/'fold_metrics.csv', index=False)
         self.predictions.to_parquet(output/'oof_predictions.parquet', index=False)
@@ -54,7 +57,8 @@ class WalkForwardResult:
         table = self.fold_metrics[['fold_id', 'n', 'reference_mae', 'candidate_mae', 'mae_delta', 'mae_improvement_pct']]
         section = '<section><h2>Walk-forward validation</h2><p>Each record is predicted once by models fitted on earlier dates. '
         section += 'Pooled metrics weight records; the table below shows each fold separately. No final holdout is evaluated. '
-        section += 'These folds are model-development evidence, not an untouched final test or a significance test.</p>'
+        section += 'These folds are model-development evidence, not an untouched final test. '
+        section += 'Shared training history and serial dependence can violate the independent-unit assumption in the optional loss tests.</p>'
         section += '<p><a href="folds.csv">Fold boundaries</a> · <a href="fold_metrics.csv">Exact fold metrics</a> · '
         section += '<a href="oof_predictions.parquet">Out-of-fold predictions</a> · <a href="walk_forward.json">Configuration</a></p>'
         section += table.head(100).to_html(index=False, escape=True)+ '</section>'

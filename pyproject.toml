@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-comparison-engine"
-version = "0.2.0"
-description = "Dataset-independent paired regression evaluation, slices and interactive reports"
+version = "0.3.0"
+description = "Generic regression comparison, paired inference, residual diagnostics and interactive reports"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "pandas>=2.2", "matplotlib>=3.7", "pyarrow>=12"]
+dependencies = ["numpy>=1.24", "pandas>=2.2", "matplotlib>=3.7", "pyarrow>=12", "scipy>=1.10"]
 
 [project.optional-dependencies]
 notebook = ["ipywidgets>=8", "ipython>=8", "jupyterlab>=4", "nbformat>=5.9", "nbclient>=0.10"]

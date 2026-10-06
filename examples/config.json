@@ -15,8 +15,34 @@
     "timezone": "UTC",
     "tolerance": 1
   },
-  "slices": ["segment", {"column": "measure_1", "bins": [0, 10, 20, "inf"], "right": false}],
-  "interactions": [["segment", "category"]],
+  "slices": [
+    "segment",
+    {
+      "column": "measure_1",
+      "bins": [
+        0,
+        10,
+        20,
+        "inf"
+      ],
+      "right": false
+    }
+  ],
+  "interactions": [
+    [
+      "segment",
+      "category"
+    ]
+  ],
   "min_count": 30,
-  "metric": "mae_delta"
+  "metric": "mae_delta",
+  "inference": {
+    "loss": "absolute",
+    "unit": "auto",
+    "correction": "by",
+    "alpha": 0.05,
+    "min_units": 10
+  },
+  "candidate_population": "candidate",
+  "include_candidate": true
 }

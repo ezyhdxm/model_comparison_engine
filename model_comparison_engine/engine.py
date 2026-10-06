@@ -1,11 +1,12 @@
 """Public paired-model API for scalar regression targets."""
 # SETUP LOGIC: These paired-review APIs use existing predictions; optional cross-validation lives separately.
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
-from .data import paired_rows, read_data
+from .data import paired_rows, candidate_rows as prepare_candidate_rows, read_data
 from .metrics import metrics, grouped_metrics, date_sensitivity
 from .slices import Slice, slice_labels, default_slices
+from .inference import InferenceConfig, grouped_tests
 
 
 class Comparison:
@@ -60,6 +61,69 @@ class Comparison:
         # REPORTING LOGIC: Return descriptive leave-one-date-out sensitivity without a training call.
         return date_sensitivity(self.rows)
 
+    def inference_config(self, inference=None):
+        # CONFIGURATION LOGIC: Resolve auto once; an explicit date/entity test requires its mapped column.
+        config = InferenceConfig() if inference is None else inference
+        if isinstance(config, dict):
+            config = InferenceConfig(**config)
+        if not isinstance(config, InferenceConfig):
+            raise TypeError('inference must be InferenceConfig, a configuration dict or None.')
+        if config.unit == 'auto':
+            config = replace(config, unit='date' if self.config['time_column'] is not None else 'record')
+        for unit, column in [('date', 'time_column'), ('entity', 'entity_column')]:
+            if config.unit == unit and self.config[column] is None:
+                raise ValueError(f'Configure {column} before using {unit}-level inference.')
+        return config
+
+    def paired_test(self, inference=None, min_count=30):
+        # INFERENCE LOGIC: Test paired losses using the same explicit policy as the slice heatmaps.
+        return grouped_tests(self.rows, [], self.inference_config(inference), min_count=min_count)
+
+    def slice_test(self, column, bins=None, labels=None, min_count=30, top_n=20, right=True, inference=None):
+        # CONFIGURATION LOGIC: Keep bin boundaries and top-category choices identical to descriptive slices.
+        spec = column if isinstance(column, Slice) else Slice(column, bins, labels, right, top_n)
+        # CORE LOGIC: STEP 1 — Preserve row-level pairing before forming each slice's test population.
+        # Input: group=['A','A','B'], reference abs=[2,4,3], candidate abs=[1,2,4].
+        # Output: A passes paired loss differences [-1,-2]; B passes [1] to the configured inference policy.
+        # Explanation: Each observed group is tested separately; adjustment covers eligible tests in this table.
+        # Trick: Group labels use exactly the same binning as slice(); no outcome-ranked regrouping is performed.
+        rows = self.rows.assign(group=slice_labels(self.rows, spec))
+        return grouped_tests(rows, ['group'], self.inference_config(inference), min_count=min_count)
+
+    def cross_slice_test(self, x, y, x_bins=None, y_bins=None, min_count=30, top_n=12,
+                         x_right=True, y_right=True, inference=None):
+        # CONFIGURATION LOGIC: Reusable Slice objects retain their own independent axis boundaries.
+        sx = x if isinstance(x, Slice) else Slice(x, x_bins, right=x_right, top_n=top_n)
+        sy = y if isinstance(y, Slice) else Slice(y, y_bins, right=y_right, top_n=top_n)
+        if sx.column == sy.column:
+            raise ValueError('Choose two different slice columns.')
+        # CORE LOGIC: STEP 1 — Pass each observed intersection to the paired inference policy.
+        # Input: x=['A','A','B'], y=['big','small','big'], paired loss differences=[-1,2,-3].
+        # Output: (A,big) receives [-1]; (A,small) receives [2]; (B,big) receives [-3].
+        # Explanation: Empty B/small has no invented observations and therefore no p-value.
+        # Trick: Multiple-testing adjustment is applied across eligible observed cells, not across missing grid cells.
+        rows = self.rows.assign(x=slice_labels(self.rows, sx), y=slice_labels(self.rows, sy))
+        return grouped_tests(rows, ['x','y'], self.inference_config(inference), min_count=min_count)
+
+    def candidate_rows(self, population='candidate'):
+        # CONFIGURATION LOGIC: Own-population diagnosis is explicit and never changes paired comparisons.
+        if population == 'paired':
+            return self.rows.copy()
+        if population != 'candidate':
+            raise ValueError("population must be 'candidate' or 'paired'.")
+        options = {k:self.config[k] for k in ['actual','candidate','time_column','entity_column',
+                   'error_scale','timezone','candidate_offset']}
+        return prepare_candidate_rows(self.data, **options)
+
+    def candidate_diagnostics(self, slices=None, *, population='candidate', min_count=30, top_n=20, bins=10):
+        # DIAGNOSTIC LOGIC: Reuse the user's explicit slices without discarding unsupported or difficult records.
+        from .diagnostics import candidate_tables
+        specs = self.default_slices if slices is None else slices
+        tables = candidate_tables(self.candidate_rows(population), specs, min_count=min_count,
+                                  tolerance=self.tolerance, top_n=top_n, bins=bins, id_column=self.config['id_column'])
+        tables['summary']['population'] = population
+        return tables
+
     def filter(self, column, *, minimum=None, maximum=None, values=None, include_missing=False,
                minimum_inclusive=True, maximum_inclusive=True):
         # VALIDATION LOGIC: Filters are explicit conditions, never evaluated as Python expressions.
@@ -109,10 +173,13 @@ class Comparison:
         counts = self.data.isna().sum()
         return pd.DataFrame({'column':counts.index,'missing_n':counts.values,'missing_pct':counts.values/max(len(self.data),1)*100})
 
-    def export(self, folder, slices=None, interactions=None, min_count=30, metric='mae_delta'):
+    def export(self, folder, slices=None, interactions=None, min_count=30, metric='mae_delta', *,
+               inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20):
         # FILE IO LOGIC: Export a new immutable review directory; never overwrite model artifacts.
         from .report import export_comparison
-        return export_comparison(self, folder, slices, interactions, min_count, metric)
+        return export_comparison(self, folder, slices, interactions, min_count, metric,
+                                 inference=inference, include_candidate=include_candidate,
+                                 candidate_population=candidate_population, candidate_top_n=candidate_top_n)
 
 
 def compare_predictions(data, actual, reference, candidate, *, reference_name=None, candidate_name=None,

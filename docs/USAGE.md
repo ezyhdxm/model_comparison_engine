@@ -20,6 +20,89 @@ MAE and RMSE are record weighted. P95 is calculated from individual absolute err
 
 When an estimator predicts a residual, supply `reference_offset="known_level"` and/or `candidate_offset="other_known_level"`. The corresponding column is added to that model's prediction before evaluation. Each model can use a different offset; the actual target must already be on the final scale. `Model(..., offset="known_level")` supplies the same behavior with fitted estimators. Offsets remain attached to model identities when the notebook reference/candidate selectors are swapped.
 
+For example, actual `105`, residual prediction `2` and offset `100` reconstruct a prediction of `102`; at `error_scale=1` the signed error is `-3` and the absolute loss is `3`. An offset is added before error scaling, and must be known at prediction time. Candidate diagnostics use the same reconstruction, even when that row has no reference prediction.
+
+## Paired statistical evidence
+
+`InferenceConfig(loss="absolute", unit="auto", correction="by", alpha=.05, min_units=10)` configures a two-sided paired test of zero mean **candidate loss minus reference loss**. Absolute loss uses the displayed error unit; squared loss uses its square and tests a mean squared-error difference, not an RMSE difference. A negative effect and t-statistic favor the candidate. The method tests paired loss differences, not signed prediction errors or independent model samples. The t statistic and pointwise confidence interval follow the related-sample mean-difference convention documented by [SciPy](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.ttest_rel.html).
+
+For 100 paired records, the input to a record-level test contains 100 candidate-minus-reference loss differences. If every reference absolute error is `2`, 50 candidate errors are `1` and 50 are `2`, those differences are 50 values of `-1` and 50 of `0`, with mean `-0.5`. Treating the two error arrays as 200 independent observations loses their pairing. Repeated dates or entities can make even those 100 paired differences dependent.
+
+| Test unit | Values supplied to the test | Weighting and exclusions |
+|---|---|---|
+| `record` | One loss difference per finite paired record | Every tested record has equal weight |
+| `date` | One mean loss difference per configured local date | Every observed date has equal weight; rows with missing dates are excluded from the test |
+| `entity` | One mean loss difference per configured entity | Every observed entity has equal weight; rows with missing entity IDs are excluded from the test |
+| `auto` | Date means when a timestamp column is configured; otherwise records | It does not silently fall back to records when configured dates are missing |
+
+An explicit `date` or `entity` unit requires the corresponding metadata mapping. Equal unit weighting can change the estimated effect: 90 records on one date with difference `-1` and 10 on another with difference `+1` give a record mean of `-0.8`, but the two date means average to `0`. There are 100 records and only 2 date units, so the default `min_units=10` does not permit a test. Ordinary MAE/RMSE tables remain record weighted.
+
+Each returned table contains these fields in addition to its group labels and recorded inference settings:
+
+| Fields | Interpretation |
+|---|---|
+| `row_count`, `n`, `paired_n` | Original paired rows in the cell; `n` and `paired_n` count finite paired losses for the selected loss |
+| `tested_n`, `excluded_unit_rows` | Rows with finite paired losses and known test-unit labels; finite-loss rows excluded for missing unit metadata |
+| `unit_count` | Number of record/date/entity values supplied to the test |
+| `mean_loss_difference` | Mean candidate-minus-reference loss across the selected units |
+| `t_statistic`, `p_value`, `q_value` | Signed t statistic, raw two-sided p value, and value adjusted within this table |
+| `ci_low`, `ci_high` | Pointwise `(1-alpha)` confidence interval for the selected-unit mean; no multiplicity adjustment |
+| `significance`, `significant` | Stars at adjusted q ≤ .05/.01/.001; a separate boolean decision at the configured alpha |
+| `low_support`, `status` | Support warning and explicit reason when testing is unavailable |
+
+Both the minimum usable record count (`tested_n >= min_count`, default 30) and minimum unit count must pass. `tested_n` counts eligible records even when support or variance rules subsequently prevent testing. A cell with any nonfinite loss is untested rather than silently dropping the overflowed record. Unsupported cells, too few usable units, nonfinite calculations, and zero or near-zero variance produce no valid p/q value or significance stars. A deterministic difference is not displayed as infinite statistical certainty. Read the `status` and counts rather than interpreting a blank test as a zero effect. Stars in significance figures denote adjusted significance, while † denotes low support in metric figures; support markers are not hypothesis-test results.
+
+The default `correction="by"` uses Benjamini–Yekutieli false-discovery-rate adjustment across finite supported tests in **one returned table**. It is a conservative default for dependence between overlapping slice tests. `"bh"` selects Benjamini–Hochberg, appropriate under independence or suitable positive dependence; `"none"` leaves `q_value` equal to the raw p value. These dependence distinctions are described in the [statsmodels FDR documentation](https://www.statsmodels.org/dev/generated/statsmodels.stats.multitest.fdrcorrection.html). An overall table, each one-way slice table and each interaction table are separate families. Correction does not extend across multiple tables, model pairs, filters, repeated Apply actions or exploratory searches.
+
+```python
+# SETUP LOGIC: Public configuration and result APIs require no training library.
+from model_comparison_engine import InferenceConfig, Slice, compare_predictions
+from model_comparison_engine.inference_plots import significance_heatmap
+# CONFIGURATION LOGIC: Declare the scored columns, units and grouping before inspecting results.
+comparison = compare_predictions(data, actual="target", reference="prediction_a", candidate="prediction_b",
+    reference_name="Model A", candidate_name="Model B", id_column="row_id",
+    time_column="timestamp", entity_column="entity_id", error_scale=1, unit="units", timezone="UTC")
+inference = InferenceConfig(loss="absolute", unit="date", correction="by", alpha=.05, min_units=10)
+measure = Slice("measure_1", [0,10,20,float("inf")], labels=["low","middle","high"], right=False)
+# REPORTING LOGIC: These methods pair existing losses and preserve the chosen slice boundaries.
+overall_test = comparison.paired_test(inference=inference, min_count=30)
+segment_tests = comparison.slice_test("segment", min_count=30, top_n=20, inference=inference)
+binned_tests = comparison.slice_test("measure_1", bins=[0,10,20,float("inf")],
+    labels=["low","middle","high"], right=False, min_count=30, inference=inference)
+interaction_tests = comparison.cross_slice_test("segment", measure, min_count=30, top_n=12, inference=inference)
+# PLOTTING LOGIC: Effect significance and support use separate annotations in the complete figure.
+figure = significance_heatmap(interaction_tests, title="Model B vs Model A", unit_label=comparison.unit)
+# FILE IO LOGIC: Export this exact test configuration alongside every chosen metric table.
+folder = comparison.export("reports/paired_review", slices=["segment",measure],
+    interactions=[("segment",measure)], min_count=30, metric="mae_delta", inference=inference,
+    include_candidate=True, candidate_population="candidate", candidate_top_n=20)
+```
+
+`slice_test(column, bins=None, labels=None, min_count=30, top_n=20, right=True, inference=None)` accepts a column or `Slice`. `cross_slice_test(x, y, x_bins=None, y_bins=None, min_count=30, top_n=12, x_right=True, y_right=True, inference=None)` accepts a column or `Slice` on each axis. `paired_test(inference=None, min_count=30)` provides the overall row. Omitting inference uses the defaults above; `comparison.inference_config(inference)` returns the resolved configuration, including the unit chosen for `auto`.
+
+The t approximation requires adequate independent units and finite, suitably behaved loss differences; grouping by date or entity does not guarantee this. Dates can remain serially correlated, entities can share shocks, and out-of-fold predictions can share training data. This release does not implement HAC standard errors, block bootstrap, or multiway dependence correction. BY addresses dependence across tests, not invalid p values caused by dependence within a test. Time-aware cross-validation prevents specified training leakage but does not solve these inference assumptions. Non-significance, especially with low support, is not proof of equivalence or no practical difference. Inspect effect sizes, intervals, coverage and loss tails alongside significance; confirm exploratory findings on a predeclared evaluation set.
+
+## Candidate diagnostics and population
+
+`comparison.candidate_rows(population="candidate")` includes all records with a finite actual, reconstructed candidate prediction and scaled candidate error, after the comparison's population filters. Missing reference predictions do not remove these records. `population="paired"` uses exactly the paired comparison rows. Thus a supplied population of 100 valid targets/candidate predictions with 10 missing reference predictions has 100 candidate records and 90 paired records; a candidate-only MAE is not directly comparable to the reference MAE on those 90 rows.
+
+```python
+# SETUP LOGIC: Candidate plots use the same stored predictions and error scaling as the comparison.
+from model_comparison_engine.diagnostic_plots import candidate_figure
+# REPORTING LOGIC: Choose the population explicitly; no prediction or reference value is imputed.
+candidate_rows = comparison.candidate_rows(population="candidate")
+diagnostics = comparison.candidate_diagnostics(slices=["segment",measure],
+    population="candidate", min_count=30, top_n=20, bins=10)
+paired_diagnostics = comparison.candidate_diagnostics(slices=["segment"], population="paired")
+# PLOTTING LOGIC: Residual distributions and actual-versus-predicted patterns describe this population.
+candidate_plot = candidate_figure(candidate_rows, diagnostics, name=comparison.candidate_name,
+    unit=comparison.unit, error_scale=comparison.config["error_scale"])
+```
+
+The returned dictionary contains `summary`, `calibration`, `residual_quantiles`, `worst_slices`, `worst_cases` and `daily` DataFrames. `slices=None` uses the comparison's generic default slices. `bins` sets the requested number of prediction-quantile calibration bins; tied boundaries can reduce the actual number. Calibration means use native target units, while residuals use the configured error scale. `min_count` flags low support and `top_n` bounds the worst-slice and worst-case tables. Slice category limits come from each `Slice.top_n`. Worst slices rank supported groups first by MAE and then include low-support groups if space remains. Error shares use the full population absolute-error total; tail contributions use errors strictly above the population P95. Shares from overlapping slice specifications must not be added together. Summary and report captions disclose the population and coverage. Signed residuals use prediction minus actual, so positive residuals indicate overprediction; quantiles and worst cases retain the tails rather than removing outliers. Worst-case rows include the supplied record ID when mapped, plus `__source_position` (position within the filtered source population) and `__source_index` (the original index label). Diagnostic rankings help inspect failure modes, but carry no automatic hypothesis tests or model-selection decision. Scatter displays use a bounded deterministic sample; aggregate tables use the full selected population.
+
+`export(..., inference=None, include_candidate=True, candidate_population="candidate", candidate_top_n=20)` includes the paired inference and candidate report by default. Set `include_candidate=False` to omit candidate outputs. CSVs provide full precision; HTML and PNGs display rounded values. The notebook Candidate tab exposes the same population choice and tables. These APIs never train, recalibrate, impute, filter by residual size, or mutate your predictions.
+
 ## Fitted estimators
 
 `Model(name, estimator, features, offset=None)` wraps any fitted object with `predict`. Feature order is explicit and may differ between the two models. Predictions must contain one scalar per input record; an `(n,1)` array is accepted, multi-output arrays are rejected. A pandas prediction must preserve the exact input index. Array predictions rely on the estimator's record-order contract.
@@ -73,7 +156,7 @@ The training target is shared by the two models. `actual=` can specify a separat
 
 `WalkForwardResult` holds `comparison`, `predictions`, `folds`, `fold_metrics` and `configuration`. Each source row is scored at most once and keeps `cv_row_position` and `cv_fold`. Pooled losses weight records; per-fold losses disclose drift and differing support. Exports describe the factory names and features, not a serialized executable training recipe: retain your factory code, library versions and parameters with the experiment.
 
-Cross-validation is development evidence, not a final untouched test or a significance test. Later folds may train on labels from earlier validation dates once those labels are available. Repeated model/slice selection on CV still requires separate final confirmation. For delayed or overlapping labels, supply label availability and a suitable embargo; those controls do not infer horizon length. Reserve final dates explicitly, or provide a development-only DataFrame. The API never evaluates or refits on the reserved final holdout and does not choose a winning model automatically. The comparison notebook stays prediction-only; [examples/walk_forward.py](../examples/walk_forward.py) contains a separate disabled-by-default training example.
+Cross-validation is development evidence, not a final untouched test or an independence guarantee for subsequent paired tests. Later folds may train on labels from earlier validation dates once those labels are available. Repeated model/slice selection on CV still requires separate final confirmation. For delayed or overlapping labels, supply label availability and a suitable embargo; those controls do not infer horizon length. Reserve final dates explicitly, or provide a development-only DataFrame. The API never evaluates or refits on the reserved final holdout and does not choose a winning model automatically. The comparison notebook stays prediction-only; [examples/walk_forward.py](../examples/walk_forward.py) contains a separate disabled-by-default training example.
 
 Out-of-fold scoring is **retrospective**: `label_available_column` gates each fold's training, but a held-out outcome can be scored even if it became available after a later decision cutoff. Before using these scores to freeze a model for a final holdout, restrict selection to outcomes known before that decision time. The generic comparison API makes no automatic selection and does not infer that cutoff for you.
 
@@ -120,12 +203,12 @@ from model_comparison_engine import show_comparison
 panel = show_comparison(data, actual="target",
     predictions={"Model A":"prediction_a", "Model B":"prediction_b", "Model C":"prediction_c"},
     id_column="row_id", time_column="timestamp", entity_column="entity_id",
-    default_slices=[Slice("segment"), measure])
+    default_slices=[Slice("segment"), measure], inference=InferenceConfig(), candidate_population="candidate")
 ```
 
-Select the reference, candidate, slice column, optional second column, bins, metric and minimum support. Two optional filter rows form an intersection. A filter with no condition is a no-op. Click **Apply comparison** to update results. Editing controls alone changes neither the applied result nor an export. Exports use the recorded applied model pair, filters, bins, metric and support threshold.
+Select the reference, candidate, slice column, optional second column, bins, metric and minimum record support. Set the loss, inference unit, correction, alpha and minimum independent units, plus the candidate diagnostic population. The Slices tab contains metric and significance views; the Candidate tab contains residual plots and all six diagnostic tables, including worst-slice support and error contribution. Two optional filter rows form an intersection. A filter with no condition is a no-op. Click **Apply comparison** to update results. Editing controls alone changes neither the applied result nor an export. Exports use the recorded applied model pair, filters, bins, metric, support thresholds, resolved inference settings, candidate population and top-group limit. Each comparison table remains its own correction family.
 
-The UI does not fit models. Swapping among columns reuses saved predictions. A failed Apply retains the previous successful result and identifies the error. No timestamp is required; date analysis is then unavailable.
+The UI does not fit models. Swapping among columns reuses saved predictions. A failed Apply retains the previous successful result and identifies the error. Candidate diagnostics remain available when the chosen candidate has valid records but the reference has none. No timestamp is required; date analysis is then unavailable and automatic inference uses records.
 
 ## Time and stability
 

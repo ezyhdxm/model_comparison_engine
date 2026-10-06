@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from .engine import compare_predictions
 from .slices import Slice
+from .inference import InferenceConfig
 
 
 def _spec(value):
@@ -27,7 +28,11 @@ def run_config(path, output=None):
     # REPORTING LOGIC: All tables and figures come from the current comparison, never hand-entered results.
     result = compare_predictions(data_path, **options)
     return result.export(output, slices=slices, interactions=interactions,
-                         min_count=config.get('min_count', 30), metric=config.get('metric', 'mae_delta'))
+                         min_count=config.get('min_count', 30), metric=config.get('metric', 'mae_delta'),
+                         inference=InferenceConfig(**config.get('inference', {})),
+                         include_candidate=config.get('include_candidate', True),
+                         candidate_population=config.get('candidate_population', 'candidate'),
+                         candidate_top_n=config.get('candidate_top_n', 20))
 
 
 def main():
