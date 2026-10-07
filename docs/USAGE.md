@@ -127,6 +127,107 @@ The returned tables are `summary`, `series`, `autocorrelation`, `spectrum`, `cha
 
 `compare_models` performs no fitting, imputation, encoding or model deserialization. Include any required preprocessing inside the fitted estimator/pipeline you pass. Saved predictions avoid inference entirely. The separate opt-in `walk_forward_compare` API below fits models when explicitly called.
 
+Version 0.5 retains fitted models in memory for explicitly requested explanations. Export never serializes estimators.
+Changing filters or selecting a cached model pair does not call `predict` again. Explanation buttons do call
+`predict` on bounded samples and show progress. A changed estimator or reconstruction offset must be re-evaluated
+before explaining its old cached predictions. See [model explanations](EXPLANATIONS.md).
+
+## More than two models
+
+Pass any number of saved prediction columns using readable display names:
+
+```python
+# SETUP LOGIC: A mapping separates readable model names from DataFrame column names.
+from model_comparison_engine import compare_prediction_set, show_comparison
+# CONFIGURATION LOGIC: Offsets are optional and belong to model identities, not reference/candidate slots.
+review = compare_prediction_set(data, actual="observed",
+    predictions={"Model A":"prediction_a", "Model B":"prediction_b", "Model C":"prediction_c"},
+    reference="Model A", candidate="Model B", time_column="timestamp", entity_column="instrument_id",
+    prediction_offsets={"Model C":"known_level"})
+# UI LOGIC: Any pair can be selected in the dropdowns; click Apply to change the evaluated pair.
+panel = show_comparison(review)
+# REPORTING LOGIC: The programmatic equivalent also reuses saved predictions.
+other_pair = review.select_models("Model B", "Model C")
+```
+
+The direct UI input `show_comparison(data, actual="observed", predictions={...}, prediction_offsets={...})`
+also accepts many prediction columns. If model predictions are stored in a separate table, use
+`attach_predictions(..., on="record_id")` first. Do not assume two separate frames share row order.
+Coverage is **pair-specific**, not the intersection of every supplied model. Switching pairs can change
+the paired cohort when prediction availability differs; review the coverage numbers before comparing gains.
+
+For fitted models:
+
+```python
+# SETUP LOGIC: Each fitted model keeps its own ordered inputs and optional additive offset.
+from model_comparison_engine import Model, compare_model_set
+# INFERENCE LOGIC: Each fitted estimator predicts once; no model is trained.
+review = compare_model_set(data, actual="observed", models=[
+    Model("Model A", fitted_a, features_a),
+    Model("Model B", fitted_b, features_b),
+    Model("Model C", fitted_c, features_c, offset="known_level")],
+    reference="Model A", candidate="Model C", time_column="timestamp", entity_column="instrument_id")
+```
+
+## Friendly filters and option meanings
+
+The workbench has four optional filter rows. Choose a column, type a search term, select one or more
+suggested categories, and add them to the filter. Suggestions are a convenience: their bounded list
+does not restrict which values the full-data filter can match. Select **Contains**, **Starts with** or
+**Ends with** for partial text, and set case sensitivity explicitly. Punctuation is literal, not regex.
+Semicolon-separated values in one row are OR; different rows are AND. Numerical bounds and categorical
+matching cannot be mixed in one row. Apply is required before results and exports change.
+
+```python
+# CONFIGURATION LOGIC: Literal case-insensitive substrings can identify a family of category names.
+subset = review.filter("issuer", values=["alpha", "beta"], match="contains", case_sensitive=False)
+subset = subset.filter("quantity", minimum=1_000_000)
+```
+
+Identifier-like names such as `instrument_id`, `CUSIP`, `ISIN` and `entity_id` appear early in the
+Entity ID menu. Ranking only helps discovery; it does not redefine your chosen identity. Entity ID is
+a repeatable instrument/entity grouping, while Record ID must uniquely identify a row.
+
+| Control | Meaning |
+|---|---|
+| Reference | The comparator for this review; it need not be a special BASE model. |
+| Candidate | The model being investigated. Either supplied model can take either role. |
+| Candidate diagnostic sample | All valid candidate records, or just the paired cohort; this never changes the paired comparison. |
+| Correction: BY | Benjamini–Yekutieli false-discovery-rate correction; allows arbitrary dependence among the slice tests when their p-values are valid. Conservative default. |
+| Correction: BH | Benjamini–Hochberg correction; less conservative, assuming independence or appropriate positive dependence among tests. |
+| Correction: None | Raw p-values; no multiple-testing control. |
+| Alpha | Threshold applied to adjusted q-values; statistical significance alone does not measure business value. |
+
+Each returned table is a separate correction family. None of these corrections fixes serially dependent
+test units or repeated exploratory model selection. See [SciPy's method reference](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.false_discovery_control.html).
+
+## Intraday and prediction-point review
+
+```python
+# CONFIGURATION LOGIC: Metadata roles are explicit; the engine never guesses side or quote conventions.
+from model_comparison_engine import TradeViewConfig
+trade_view = TradeViewConfig(frequency="auto", min_count=10, max_points=2000,
+    side_column="side", counterparty_column="counterparty_type", dealer_column="dealer_id",
+    quantity_column="quantity")
+# UI LOGIC: Applied filters also restrict the point plots and intraday metrics.
+panel = show_comparison(review, trades=trade_view)
+# REPORTING LOGIC: Complete bin statistics and the exact displayed point sample remain available.
+trade_tables = review.trade_diagnostics(trade_view)
+# FILE IO LOGIC: Include full PNGs, bin CSVs and offline interactive plots when Plotly is installed.
+report_folder = review.export("reports", trades=trade_view)
+```
+
+Auto resolution uses the calendar span: up to three days uses 30-minute bins, up to fourteen uses
+hourly bins, and longer spans use daily bins. Explicit intervals are available. Empty/unsupported bins
+remain gaps. Statistical test units are unchanged: finer plotting intervals do not manufacture
+independent observations. Prediction-versus-actual plots also work without timestamps; time plots require them.
+Point sampling affects only the plots; bin metrics use all paired records. Hover preserves exact
+metadata and prediction values. See [trade view details](TRADES.md).
+
+The Time series tab now reports **Observed / Meaning / Next check** alongside computed coverage,
+autocorrelation, spectrum and mean-shift results. These explanations describe actual returned tables;
+they do not claim forecasting gains or calibrated significance for a scanned spectral peak.
+
 ## Walk-forward cross-validation
 
 `walk_forward_splits(data, time_column, settings, timezone='UTC')` is a model-independent splitter. `WalkForwardConfig` counts **observed local dates**, so one busy date cannot straddle Train and Validation. It rejects invalid feature timestamps and overlapping validation windows. Nothing reads targets or fits a model while planning folds.

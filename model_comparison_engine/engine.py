@@ -17,6 +17,97 @@ class Comparison:
         self.unit, self.tolerance = config['unit'], config['tolerance']
         self.default_slices = default_slices(rows.columns) if config['time_column'] is not None else []
         self.filter_history = []
+        self.models, self.explanations = {}, {}
+        self.prediction_columns = {self.reference_name:config['reference'], self.candidate_name:config['candidate']}
+        self.prediction_offsets = {self.reference_name:config['reference_offset'], self.candidate_name:config['candidate_offset']}
+
+    def select_models(self, reference, candidate):
+        """Select two cached predictions; no inference or training is performed."""
+        # CONFIGURATION LOGIC: Preserve metadata and named offsets while changing only the selected pair.
+        from .model_sets import compare_prediction_set
+        options = {k:v for k,v in self.config.items() if k not in
+                   {'actual','reference','candidate','reference_name','candidate_name','reference_offset','candidate_offset'}}
+        result = compare_prediction_set(self.data, self.config['actual'], self.prediction_columns,
+            reference=reference, candidate=candidate, prediction_offsets=self.prediction_offsets, **options)
+        result.models, result.filter_history = dict(self.models), list(self.filter_history)
+        return result
+
+    def _explanation_input(self, model, population):
+        # VALIDATION LOGIC: Saved predictions cannot identify model internals or simulate feature perturbations.
+        name = self.candidate_name if model is None else model
+        if name not in self.models:
+            raise ValueError('Explanations require a fitted model. Use compare_models or compare_model_set first.')
+        fitted = self.models[name]
+        if fitted.name != name or fitted.offset != self.prediction_offsets.get(name):
+            raise ValueError('Model identity or offset changed after prediction. Rebuild the comparison before explaining it.')
+        if population not in {'paired','model'}:
+            raise ValueError("Use population='paired' or 'model' for explanations.")
+        # CORE LOGIC: STEP 1 — Recover feature rows by position, preserving duplicate input indexes safely.
+        # Input: data index=[7,7,9], x=[10,20,30], paired source positions=[0,2], population='paired'.
+        # Output: selected x=[10,30], index=[7,9]; x=20 is not accidentally reintroduced by a label join.
+        # Explanation: Paired explanations use the same finite actual and two predictions as the error comparison.
+        # Trick: iloc uses source positions; the model population lets the explanation function audit its own rows.
+        frame = self.data.iloc[self.rows['__source_position']] if population == 'paired' else self.data
+        return name, self.models[name], frame
+
+    def _explanation_options(self, name, options):
+        # VALIDATION LOGIC: Comparison-bound explanations use exactly the same declared unit and reconstruction audit.
+        fixed = dict(error_scale=self.config['error_scale'], unit=self.unit,
+                     expected_prediction_column=self.prediction_columns[name])
+        for key, value in fixed.items():
+            if key in options and options[key] != value:
+                raise ValueError(f'{key} must match the applied comparison; use the standalone explanation API to change it.')
+            options[key] = value
+        return options
+
+    def _record_explanation(self, result, population):
+        # CONFIGURATION LOGIC: Public row_position remains relative to the explicitly selected explanation cohort.
+        positions = self.rows['__source_position'].to_numpy() if population == 'paired' else np.arange(len(self.data))
+        identity = self.config['id_column']
+        # CORE LOGIC: STEP 1 — Attach an unambiguous link back to the applied input table.
+        # Input: paired source positions=[1,3], explanation row_position=[1], data record IDs=['a','b','c','d'].
+        # Output: comparison_source_position=[3], record_id=['d']; explanation row_position stays [1].
+        # Explanation: Feature-level tables may repeat a position; every contribution gets the same source identity.
+        # Trick: NumPy positional lookup is safe when original pandas index labels are duplicated.
+        for table in result.tables.values():
+            if 'row_position' in table:
+                source = positions[table['row_position'].to_numpy(dtype=int)]
+                table['comparison_source_position'] = source
+                if identity is not None:
+                    table['record_id'] = self.data.iloc[source][identity].to_numpy()
+        # REPORTING LOGIC: Sampling positions and record keys remain interpretable outside the live notebook.
+        result.settings['record_id_column'] = identity
+        result.settings['position_scope'] = 'row_position: explanation cohort; comparison_source_position: applied comparison.data'
+        return result
+
+    def permutation_importance(self, model=None, *, population='paired', **kwargs):
+        """Measure held-out loss changes for a retained model; results are included in later exports."""
+        # EXPLANATION LOGIC: Expensive repeated predictions happen only on explicit request.
+        from .explainability import permutation_importance
+        name, fitted, frame = self._explanation_input(model, population)
+        kwargs = self._explanation_options(name, kwargs)
+        result = permutation_importance(frame, self.config['actual'], fitted, **kwargs)
+        self._record_explanation(result, population)
+        result.settings.update(population=population, filters=list(self.filter_history), unit=self.unit)
+        self.explanations[f'permutation:{name}'] = result
+        return result
+
+    def shap_values(self, model=None, *, population='paired', **kwargs):
+        """Explain retained fitted tree predictions, keeping any additive offset separate."""
+        # EXPLANATION LOGIC: Verify contribution additivity before presenting local or aggregate explanations.
+        from .explainability import tree_shap
+        name, fitted, frame = self._explanation_input(model, population)
+        kwargs = self._explanation_options(name, kwargs)
+        result = tree_shap(frame, fitted, actual=self.config['actual'], **kwargs)
+        self._record_explanation(result, population)
+        result.settings.update(population=population, filters=list(self.filter_history), unit=self.unit)
+        self.explanations[f'shap:{name}'] = result
+        return result
+
+    def trade_diagnostics(self, settings=None):
+        # REPORTING LOGIC: Intraday metrics use all paired records; plotting samples are reported separately.
+        from .trade_view import trade_tables
+        return trade_tables(self, settings)
 
     def summary(self, min_count=30):
         # REPORTING LOGIC: Reuse the same metric definitions at every aggregation level.
@@ -153,12 +244,17 @@ class Comparison:
         return tables
 
     def filter(self, column, *, minimum=None, maximum=None, values=None, include_missing=False,
-               minimum_inclusive=True, maximum_inclusive=True):
+               minimum_inclusive=True, maximum_inclusive=True, match='exact', case_sensitive=True):
         # VALIDATION LOGIC: Filters are explicit conditions, never evaluated as Python expressions.
         if column not in self.data:
             raise ValueError(f'Unknown filter column: {column!r}')
         if values is not None and (minimum is not None or maximum is not None):
             raise ValueError('Use either category values or numerical boundaries in one filter.')
+        from .filtering import category_mask
+        if match not in {'exact','contains','starts_with','ends_with'}:
+            raise ValueError('match must be exact, contains, starts_with or ends_with.')
+        if isinstance(values, str):
+            values = [values]
         # CORE LOGIC: STEP 1 — Filter the original population, then recalculate paired coverage and losses.
         # Input: measure=[5,10,20,None], minimum=10, include_missing=False.
         # Output: retained measure=[10,20]; total and paired counts are recalculated on 2 rows.
@@ -166,7 +262,7 @@ class Comparison:
         # Trick: Chained filters form intersections; prediction values are reused and no models are fitted.
         source = self.data[column]
         number = pd.to_numeric(source, errors='coerce').replace([np.inf,-np.inf], np.nan)
-        mask = source.notna() if values is None else source.astype('string').isin([str(v) for v in values])
+        mask = source.notna() if values is None else category_mask(source, values, match=match, case_sensitive=case_sensitive)
         if minimum is not None:
             mask &= number.ge(minimum) if minimum_inclusive else number.gt(minimum)
         if maximum is not None:
@@ -175,8 +271,11 @@ class Comparison:
         result = compare_predictions(self.data.loc[mask], **self.config)
         # REPORTING LOGIC: Preserve population conditions in every exported review and chained filter.
         condition = dict(column=column,minimum=minimum,maximum=maximum,values=values,include_missing=include_missing,
-                         minimum_inclusive=minimum_inclusive,maximum_inclusive=maximum_inclusive)
+                         minimum_inclusive=minimum_inclusive,maximum_inclusive=maximum_inclusive,
+                         match=match,case_sensitive=case_sensitive)
         result.filter_history = self.filter_history+[condition]
+        result.models = dict(self.models)
+        result.prediction_columns, result.prediction_offsets = dict(self.prediction_columns), dict(self.prediction_offsets)
         return result
 
     def cases(self, limit=20, order='harm'):
@@ -203,13 +302,14 @@ class Comparison:
 
     def export(self, folder, slices=None, interactions=None, min_count=30, metric='mae_delta', *,
                inference=None, include_candidate=True, candidate_population='candidate', candidate_top_n=20,
-               temporal=None, temporal_population=None, temporal_entity=None):
+               temporal=None, temporal_population=None, temporal_entity=None, trades=None):
         # FILE IO LOGIC: Export a new immutable review directory; never overwrite model artifacts.
         from .report import export_comparison
         return export_comparison(self, folder, slices, interactions, min_count, metric,
                                  inference=inference, include_candidate=include_candidate,
                                  candidate_population=candidate_population, candidate_top_n=candidate_top_n,
-                                 temporal=temporal, temporal_population=temporal_population, temporal_entity=temporal_entity)
+                                 temporal=temporal, temporal_population=temporal_population, temporal_entity=temporal_entity,
+                                 trades=trades)
 
 
 def compare_predictions(data, actual, reference, candidate, *, reference_name=None, candidate_name=None,
@@ -272,6 +372,9 @@ def compare_models(data, actual, reference, candidate, **kwargs):
         raise TypeError('Wrap both fitted estimators in Model(name, estimator, features, offset=None).')
     # INFERENCE LOGIC: Prediction only, using explicit independent feature schemas.
     frame[columns[0]], frame[columns[1]] = _predict(frame, reference), _predict(frame, candidate)
-    return compare_predictions(frame, actual, *columns, reference_name=reference.name,
+    result = compare_predictions(frame, actual, *columns, reference_name=reference.name,
                                candidate_name=candidate.name, reference_offset=reference.offset,
                                candidate_offset=candidate.offset, **kwargs)
+    # OBJECT LIFECYCLE LOGIC: Keep fitted estimators in memory for optional explanations; never serialize them.
+    result.models = {m.name:Model(m.name,m.estimator,list(m.features),m.offset) for m in [reference,candidate]}
+    return result

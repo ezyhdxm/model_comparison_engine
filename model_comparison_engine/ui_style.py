@@ -22,6 +22,11 @@ NOTEBOOK_STYLE = """
 .analysis-workbench .analysis-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;gap:13px;width:100%;min-width:0}
 .analysis-workbench .analysis-card-heading h3{font-size:16px;color:var(--ink);margin:0 0 3px;line-height:1.4}
 .analysis-workbench .analysis-card-heading p,.analysis-workbench .analysis-help{color:var(--muted);margin:0;font-size:13px;line-height:1.6}
+.analysis-workbench .analysis-help p{margin:0 0 9px}.analysis-workbench .analysis-help p:last-child{margin-bottom:0}
+.analysis-workbench .analysis-guidance{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:12px}
+.analysis-workbench .analysis-guidance-card{padding:14px 16px;border:1px solid #cbdde4;border-left:4px solid #208594;border-radius:9px;background:#f4fafb;min-width:0}
+.analysis-workbench .analysis-guidance-card h4{font-size:14px;margin:0 0 8px;color:#185362}
+.analysis-workbench .analysis-guidance-card p{font-size:12px;line-height:1.6;margin:6px 0;white-space:normal;overflow-wrap:anywhere}
 .analysis-workbench .analysis-step{display:inline-flex;align-items:center;justify-content:center;background:#e4f2f2;color:#075965;
   width:27px;height:27px;border-radius:8px;margin-right:8px;font-size:12px;vertical-align:middle}
 .analysis-workbench .analysis-row{display:flex;flex-flow:row wrap;align-items:flex-end;gap:12px;width:100%;min-width:0}

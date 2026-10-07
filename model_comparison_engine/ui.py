@@ -3,15 +3,18 @@
 from html import escape
 from io import BytesIO
 from dataclasses import replace
+import re
 import numpy as np
 from pandas.api.types import is_numeric_dtype
 import ipywidgets as w
 from IPython.display import display
-from .data import read_data
+from .data import read_data, candidate_rows as prepare_candidate_rows
 from .ui_style import control, row, section, disclosure, hero, badge, table_html, style_root
 from .engine import Comparison, compare_predictions
 from .inference import InferenceConfig
 from .temporal import TemporalConfig
+from .trade_view import TradeViewConfig
+from .temporal_interpretation import temporal_interpretation
 from . import temporal_plots
 from .diagnostics import candidate_tables
 from .slices import Slice, default_slices
@@ -47,6 +50,17 @@ def _table(table, title):
     return w.HTML(table_html(table, title=title))
 
 
+def _guidance(table):
+    # UI LOGIC: Narrative diagnostic findings wrap as cards instead of extending a numeric table horizontally.
+    cards = []
+    for item in table.to_dict('records'):
+        title = escape(str(item.get('topic','Interpretation')))
+        body = ''.join('<p><b>'+label+':</b> '+escape(str(item.get(key,'')))+'</p>' for key,label in
+                       [('observation','Observed'),('interpretation','Meaning'),('next_check','Next check')])
+        cards.append('<article class="analysis-guidance-card"><h4>'+title+'</h4>'+body+'</article>')
+    return w.HTML('<div class="analysis-guidance">'+''.join(cards)+'</div>')
+
+
 def _filter_text(condition):
     # UI LOGIC: Present the recorded population in readable terms instead of a Python configuration dict.
     column, parts = condition['column'], []
@@ -55,9 +69,25 @@ def _filter_text(condition):
     if condition['maximum'] is not None:
         parts.append(f'{column} {"<=" if condition["maximum_inclusive"] else "<"} {condition["maximum"]:,.8g}')
     if condition['values'] is not None:
-        parts.append(f'{column} in '+', '.join(str(v) for v in condition['values']))
+        mode = {'exact':'equals','contains':'contains','starts_with':'starts with','ends_with':'ends with'}[condition.get('match','exact')]
+        parts.append(f'{column} {mode} '+ ' or '.join(repr(str(v)) for v in condition['values']))
+        if not condition.get('case_sensitive',True):
+            parts.append('ignoring case')
     text = ' and '.join(parts) or f'{column} is present'
     return text+(' (including missing)' if condition['include_missing'] else '')
+
+
+def _entity_columns(columns):
+    # UI LOGIC: Rank identifier-like column names without inspecting records or changing the selected mapping.
+    priorities = {'entityid':0,'cusip':0,'cusipid':0,'isin':0,'bondid':0,'securityid':0,
+                  'instrumentid':0,'securityidentifier':0,'bond':1,'entity':1,'issuerid':2,'issuer':2,'ticker':3}
+    def score(column):
+        normalized = re.sub(r'[^a-z0-9]','',str(column).lower())
+        exact = priorities.get(normalized)
+        if exact is not None:
+            return exact
+        return 1 if any(token in normalized for token in ['cusip','isin','bondid','entityid','securityid','instrumentid']) else 9
+    return sorted(columns,key=score)
 
 
 class ComparisonPanel:
@@ -65,15 +95,18 @@ class ComparisonPanel:
     def __init__(self, data=None, *, actual=None, predictions=None, id_column=None, time_column=None,
                  entity_column=None, error_scale=1, unit='units', timezone='UTC',
                  default_slices=None, tolerance=1, reference_offset=None, candidate_offset=None,
-                 inference=None, candidate_population='candidate', temporal=None):
+                 inference=None, candidate_population='candidate', temporal=None, prediction_offsets=None, trades=None):
         # CONFIGURATION LOGIC: Preserve advanced API settings while exposing common temporal choices in the form.
         self.temporal_defaults = TemporalConfig(**temporal) if isinstance(temporal,dict) else temporal
         if self.temporal_defaults is not None and not isinstance(self.temporal_defaults,TemporalConfig):
             raise TypeError('temporal must be a TemporalConfig, a dictionary, or None.')
+        self.trade_defaults = trades
         self.result, self.applied_specs, self.busy = None, None, False
         self._applied_control_state = None
         self.supplied_slices = default_slices
         self.prediction_mapping = predictions
+        self.models = {}
+        self._suggestion_cache = {}
         self.offsets = dict(reference_offset=reference_offset,candidate_offset=candidate_offset)
         self.initial_filters = []
         self.initial_names = None
@@ -83,8 +116,10 @@ class ComparisonPanel:
             time_column, entity_column = existing.config['time_column'], existing.config['entity_column']
             error_scale, unit, timezone = existing.config['error_scale'], existing.unit, existing.config['timezone']
             tolerance = existing.tolerance
-            predictions = {existing.reference_name:existing.config['reference'],existing.candidate_name:existing.config['candidate']}
+            predictions = dict(existing.prediction_columns)
             self.prediction_mapping = predictions
+            self.models = dict(existing.models)
+            prediction_offsets = dict(existing.prediction_offsets)
             self.offsets = {k:existing.config[k] for k in ['reference_offset','candidate_offset']}
             self.initial_filters = list(existing.filter_history)
             self.initial_names = (existing.reference_name,existing.candidate_name)
@@ -95,6 +130,9 @@ class ComparisonPanel:
         self.load.on_click(self.load_data)
         self.actual = w.Dropdown(description='Actual:')
         self.reference, self.candidate = w.Dropdown(description='Reference:'),w.Dropdown(description='Candidate:')
+        self.swap = w.Button(description='Swap models',tooltip='Exchange the reference and candidate; click Apply to refresh results.')
+        self.swap.on_click(self.swap_models)
+        self.model_help = w.HTML()
         self.identity, self.time, self.entity = [w.Dropdown(description=label) for label in ['Record ID:','Timestamp:','Entity ID:']]
         self.scale, self.unit, self.zone = w.FloatText(value=error_scale,description='Error scale:'),w.Text(value=unit,description='Unit:'),w.Text(value=timezone,description='Timezone:')
         self.tolerance = w.FloatText(value=tolerance,description='Tolerance:')
@@ -111,13 +149,13 @@ class ComparisonPanel:
         self.loss = w.Dropdown(options=[('Absolute error','absolute'),('Squared error','squared')],value=inference.loss,description='Test loss:')
         self.test_unit = w.Dropdown(options=[('Auto: date if supplied','auto'),('Record','record'),('Date','date'),('Entity','entity')],
                                     value=inference.unit,description='Test unit:')
-        self.correction = w.Dropdown(options=[('BY (dependent tests)','by'),('BH','bh'),('None','none')],value=inference.correction,description='Correction:')
+        self.correction = w.Dropdown(options=[('BY: more conservative','by'),('BH: less conservative','bh'),('None: unadjusted','none')],value=inference.correction,description='Multiple-test correction:')
         self.alpha = w.BoundedFloatText(value=inference.alpha,min=.000001,max=.999999,step=.01,description='Alpha:')
         self.min_units = w.BoundedIntText(value=inference.min_units,min=2,max=100000000,description='Min units:')
         self.candidate_population = w.Dropdown(options=[('All valid candidate records','candidate'),('Paired records only','paired')],
-                                              value=candidate_population,description='Candidate:',layout=w.Layout(width='420px'))
-        self.filters = [self.make_filter(),self.make_filter()]
-        self.offset_mapping = {}
+                                              value=candidate_population,description='Candidate diagnostic sample:',layout=w.Layout(width='420px'))
+        self.filters = [self.make_filter(number) for number in range(1,5)]
+        self.offset_mapping = dict(prediction_offsets or {})
         self.apply = w.Button(description='Apply comparison',button_style='primary')
         self.apply.on_click(self.run)
         self.export_path = w.Text(value='outputs/model_comparisons',description='Export to:',layout=w.Layout(width='70%'))
@@ -148,25 +186,50 @@ class ComparisonPanel:
         self.temporal_rolling = w.BoundedIntText(value=settings.rolling_bins,min=1,max=10000,description='Rolling window (bins):')
         self.temporal_min_count = w.BoundedIntText(value=settings.min_bin_count,min=1,max=100000000,description='Minimum records per bin:')
         self.temporal_max_lag = w.BoundedIntText(value=settings.max_lag,min=0,max=1000,description='Autocorrelation lags:')
+        self._make_trade_controls()
         self.pending = w.HTML(badge('Ready to configure'))
-        data_inputs = section('Data and predictions',row(self.path,self.load),row(self.actual,self.reference,self.candidate),
+        data_inputs = section('Data and predictions',row(self.path,self.load),row(self.actual,self.reference,self.candidate,self.swap),self.model_help,
+            w.HTML('<p class="analysis-help"><b>Reference</b> is the model used as your comparison benchmark; <b>Candidate</b> is the model you are investigating. '
+                   'Either can be any supplied model. Candidate minus reference error below zero means the candidate is better. '
+                   'Switch the pair, then Apply; saved predictions are reused.</p>'),
             disclosure('Identifiers, units and timestamp settings',row(self.identity,self.time,self.entity),
-                       row(self.scale,self.unit,self.zone,self.tolerance)),
-            note='Load a saved table, then choose the observed outcome and the two prediction columns.',step='01')
+                       row(self.scale,self.unit,self.zone,self.tolerance),
+                       w.HTML('<p class="analysis-help"><b>Entity ID</b> identifies the same instrument across repeated observations, such as a bond identifier. '
+                              'Likely identifier names appear first; ordering is a suggestion, not a validated mapping. '
+                              'Choose issuer instead only when you intentionally want issuer-level event sequences.</p>')),
+            note='Provide any number of prediction columns, then select two models for the applied comparison.',step='01')
         slice_controls = section('Choose the view',row(self.first,self.second,self.metric),row(self.minimum,self.top_n),
             disclosure('Custom bin boundaries',row(self.first_bins,self.first_right),row(self.second_bins,self.second_right),
                        w.HTML('<p class="analysis-help">Comma-separated edges, for example -inf, 0, 1, inf. Leave blank for unbinned groups.</p>')),
             note='Negative candidate-minus-reference error deltas indicate improvement. Low-support groups remain visibly flagged.',step='02')
         inference_controls = disclosure('Inference and candidate diagnostics',
             row(self.loss,self.test_unit,self.correction),row(self.alpha,self.min_units,self.candidate_population),
-            w.HTML('<p class="analysis-help">Two-sided paired mean loss tests. Negative t favors the candidate. Date/entity means receive equal weight. '
-                   'Minimum records and units must both pass; each table is a separate correction family.</p>'))
+            w.HTML('<div class="analysis-help"><p><b>Why correction?</b> Testing many slices increases the chance of false discoveries. '
+                   'Correction adjusts p-values into q-values within each displayed table. '
+                   '<b>BY</b> controls false discovery rate under arbitrary dependence among tests and is the conservative default. '
+                   '<b>BH</b> is less conservative and relies on independence or certain positive dependence conditions. '
+                   '<b>None</b> uses raw p-values, suitable for exploratory reading without a multiple-testing guarantee.</p>'
+                   '<p><b>Test unit</b> controls the observations used by the paired t-test. Date/entity means receive equal weight; '
+                   'MAE tables still weight individual records equally. These settings do not remove dependence between dates or entities. '
+                   'Negative t favors the candidate. Minimum records and units must both pass. '
+                   '<b>Alpha</b> is the decision threshold; q ≤ alpha is flagged significant, not necessarily economically meaningful.</p>'
+                   '<p><b>Candidate diagnostic sample</b> applies only to the candidate\'s own residual diagnostics. '
+                   'The two-model comparison always uses paired records: finite actual and usable predictions from both models.</p></div>'))
         temporal_controls = disclosure('Optional time-series diagnostics',row(self.temporal_enabled),
             row(self.temporal_frequency,self.temporal_signal),row(self.temporal_rolling,self.temporal_min_count,self.temporal_max_lag),
             w.HTML('<p class="analysis-help">Enable before Apply to inspect trends, rolling errors, autocorrelation, spectral peaks and changes. '
                    'Requires a timestamp column. These diagnostics describe the selected records.</p>'))
+        trade_controls = disclosure('Trade-level and intraday views',row(self.trade_enabled,self.trade_frequency,self.trade_max_points),
+            row(self.trade_side,self.trade_counterparty,self.trade_dealer,self.trade_quantity),
+            w.HTML('<p class="analysis-help">Compare actual and reconstructed predictions at individual trade times. '
+                   'Map optional transaction-side, counterparty type, dealer ID and quantity columns explicitly; these describe records and are not inferred from model names. '
+                   'Auto interval uses 30 minutes for a span of up to 3 local days, 1 hour for up to 14, otherwise daily. '
+                   'The point chart uses a reproducible bounded sample; interval metrics use all paired records.</p>'))
         filters = disclosure('Optional population filters',*[item['widget'] for item in self.filters],
-            w.HTML('<p class="analysis-help">The two filter rows form an intersection. Blank conditions leave the population unrestricted.</p>'))
+            w.HTML('<p class="analysis-help">Active filter rows are combined with AND. Values separated by semicolons use OR within one row. '
+                   'Use Contains for a fragment such as ALPHA; matching treats text literally, not as a regular expression. '
+                   'Suggestions use at most the first 10,000 nonmissing rows, so type any value even if absent from the list. '
+                   'Blank conditions leave the population unrestricted. Filters only change evaluation records, never the stored predictions.</p>'))
         actions = row(self.apply,self.pending).add_class('analysis-actions')
         self.status.add_class('analysis-status')
         self.applied.add_class('analysis-applied')
@@ -177,7 +240,7 @@ class ComparisonPanel:
         export = section('Save the applied review',row(self.export_path,self.export_button),
                          note='Export figures, full tables and an HTML report using the last successful comparison.')
         self.widget = style_root(w.VBox([hero('Compare two models','Inspect a reference and candidate on the same records, then explore where errors improve or deteriorate.',
-            tags=('Saved predictions','Explicit Apply','Portable review')),data_inputs,slice_controls,inference_controls,temporal_controls,filters,
+            tags=('Multiple model choices','Explicit Apply','Portable review')),data_inputs,slice_controls,inference_controls,temporal_controls,trade_controls,filters,
             actions,self.status,self.applied,self.views,export]))
         for item in [self.path,self.export_path]:
             control(item,wide=True)
@@ -188,12 +251,28 @@ class ComparisonPanel:
                  'first','second','first_bins','second_bins','first_right','second_right','minimum','top_n','metric']
         names += ['loss','test_unit','correction','alpha','min_units','candidate_population',
                   'temporal_enabled','temporal_frequency','temporal_signal','temporal_rolling','temporal_min_count','temporal_max_lag']
+        names += ['trade_enabled','trade_frequency','trade_max_points','trade_side','trade_counterparty','trade_dealer','trade_quantity']
         self._pending_controls = [getattr(self,name) for name in names]
-        self._pending_controls += [item[key] for item in self.filters for key in ['column','low','high','strict','categories']]
+        self._pending_controls += [item[key] for item in self.filters for key in ['column','low','high','strict','categories','match','case_sensitive']]
         for item in self._pending_controls:
             control(item,wide=item is self.metric)
             item.observe(self._pending_changed,names='value')
         self._pending_changed()
+
+    def _make_trade_controls(self):
+        # UI LOGIC: Optional role mappings describe transaction records independently of prediction features.
+        settings = TradeViewConfig(**self.trade_defaults) if isinstance(self.trade_defaults,dict) else self.trade_defaults
+        self._trade_config = settings or TradeViewConfig()
+        if not isinstance(self._trade_config,TradeViewConfig):
+            raise TypeError('trades must be a TradeViewConfig, a dictionary, or None.')
+        frequencies = [('Auto: based on date span','auto'),('15 minutes','15min'),('30 minutes','30min'),('Hourly','1h'),('Daily','1D')]
+        if self._trade_config.frequency not in dict(frequencies).values():
+            frequencies.append((self._trade_config.frequency,self._trade_config.frequency))
+        self.trade_enabled = w.Checkbox(value=True,description='Include trade-level views')
+        self.trade_frequency = w.Dropdown(description='Comparison interval:',options=frequencies,value=self._trade_config.frequency)
+        self.trade_max_points = w.BoundedIntText(description='Maximum plotted trades:',value=self._trade_config.max_points,min=1,max=100000)
+        self.trade_side,self.trade_counterparty,self.trade_dealer,self.trade_quantity = [w.Dropdown(description=label) for label in
+            ['Buy / sell column:','Counterparty type column:','Dealer ID column:','Quantity column:']]
 
     def _control_state(self):
         # UI LOGIC: Compare literal widget values plus the loaded-table identity; export-path edits are independent.
@@ -214,6 +293,7 @@ class ComparisonPanel:
         # UI LOGIC: Lock mutable inputs while an explicit action runs and restore the existing result afterward.
         self.busy = busy
         self.apply.disabled = self.load.disabled = busy
+        self.swap.disabled = busy
         self.export_button.disabled = busy or self.result is None
         for item in self._pending_controls:
             item.disabled = busy
@@ -221,13 +301,34 @@ class ComparisonPanel:
         self.export_button.description = 'Exporting…' if busy and exporting else 'Export applied review'
         self._pending_changed()
 
-    def make_filter(self):
-        # UI LOGIC: Two optional filters define an intersection of user-selected metadata conditions.
+    def swap_models(self, _=None):
+        # UI LOGIC: Swap only pending model choices; the applied comparison and export remain unchanged.
+        if not self.busy:
+            reference, candidate = self.reference.value, self.candidate.value
+            self.reference.value, self.candidate.value = candidate, reference
+
+    def make_filter(self, number):
+        # UI LOGIC: Searchable suggestions support exact or partial literal text without requiring full issuer names.
         fields = dict(column=w.Dropdown(description='Column:'),low=w.Text(description='Lower:'),high=w.Text(description='Upper:'),
-                      strict=w.Checkbox(value=False,description='Strict lower >'),categories=w.Text(description='Values:',placeholder='A; B; C (optional)'))
-        fields['widget'] = w.VBox([row(fields['column'],fields['low'],fields['high']),row(fields['strict'],fields['categories'])],
-                                   layout=w.Layout())
+                      strict=w.Checkbox(value=False,description='Strict lower >'),
+                      categories=w.Combobox(description='Values / fragments:',placeholder='Type or select; separate alternatives with ;',ensure_option=False),
+                      match=w.Dropdown(description='Text match:',options=[('Exact value','exact'),('Contains text','contains'),('Starts with','starts_with'),('Ends with','ends_with')]),
+                      case_sensitive=w.Checkbox(value=False,description='Case sensitive'))
+        fields['column'].observe(lambda _:self.filter_suggestions(fields),names='value')
+        fields['widget'] = disclosure(f'Filter {number}',row(fields['column'],fields['low'],fields['high']),
+                                      row(fields['categories'],fields['match'],fields['case_sensitive'],fields['strict']),opened=number==1)
         return fields
+
+    def filter_suggestions(self, fields):
+        # UI LOGIC: A bounded, cached suggestion list assists typing but never restricts accepted filter values.
+        column = fields['column'].value
+        if column is None or self.data is None:
+            fields['categories'].options = ()
+            return
+        if column not in self._suggestion_cache:
+            sample = self.data[column].dropna().iloc[:10000].astype(str)
+            self._suggestion_cache[column] = tuple(sample.value_counts().head(250).index)
+        fields['categories'].options = self._suggestion_cache[column]
 
     def configure(self, actual=None, identity=None, time=None, entity=None):
         # UI LOGIC: Populate selectors without guessing hidden metadata or running a prediction.
@@ -241,6 +342,10 @@ class ComparisonPanel:
             raise ValueError('Supply at least two prediction columns, or use compare_models first.')
         if not set(mapping.values()).issubset(columns):
             raise ValueError('A configured prediction column does not exist in this data.')
+        if not set(self.offset_mapping).issubset(mapping):
+            raise ValueError('prediction_offsets contains a model name absent from predictions.')
+        if any(column is not None and column not in columns for column in self.offset_mapping.values()):
+            raise ValueError('A prediction offset column does not exist in this data.')
         self.mapping = mapping
         self.reference.options = self.candidate.options = list(mapping)
         preferred_reference = self.initial_names[0] if self.initial_names else None
@@ -248,12 +353,12 @@ class ComparisonPanel:
         others = [c for c in mapping if c != self.reference.value]
         preferred_candidate = self.initial_names[1] if self.initial_names else None
         self.candidate.value = preferred_candidate or next((c for c in ['Candidate','candidate_prediction','Candidate prediction'] if c in others),others[0])
-        if not self.offset_mapping:
-            self.offset_mapping = {self.reference.value:self.offsets['reference_offset'],
-                                   self.candidate.value:self.offsets['candidate_offset']}
+        self.offset_mapping.setdefault(self.reference.value,self.offsets['reference_offset'])
+        self.offset_mapping.setdefault(self.candidate.value,self.offsets['candidate_offset'])
         for control,value,aliases in [(self.identity,identity,['row_id','record_id']),(self.time,time,['time','timestamp']),
                                       (self.entity,entity,['entity_id'])]:
-            control.options = [('Not supplied',None)]+[(str(c),c) for c in columns]
+            ranked = _entity_columns(columns) if control is self.entity else columns
+            control.options = [('Not supplied',None)]+[(str(c),c) for c in ranked]
             control.value = value if value in columns else next((c for c in aliases if c in columns),None)
         supplied = self.supplied_slices
         defaults = supplied if supplied is not None else (default_slices(columns) if self.time.value else [])
@@ -271,6 +376,15 @@ class ComparisonPanel:
         self.set_bins(self.first,self.first_bins,self.first_right)
         for item in self.filters:
             item['column'].options = [('No filter',None)]+[(str(c),c) for c in columns]
+        for selector, name in [(self.trade_side,'side_column'),(self.trade_counterparty,'counterparty_column'),
+                               (self.trade_dealer,'dealer_column'),(self.trade_quantity,'quantity_column')]:
+            value = getattr(self._trade_config,name)
+            selector.options = [('Not supplied',None)]+[(str(c),c) for c in columns]
+            selector.value = value if value in columns else None
+        self.model_help.value = ('<p class="analysis-help"><b>'+str(len(mapping))+' selectable prediction series:</b> '+
+                                 ', '.join(escape(str(name)) for name in mapping)+'. '+
+                                 ('Fitted model objects are attached; feature explanations are available.' if self.models else
+                                  'Prediction-only input: residual and slice diagnostics are available; feature explanations require fitted models.')+'</p>')
         self.status.value = f'Loaded {len(self.data):,} rows and {len(columns)} columns. Select predictions and Apply.'
 
     def set_bins(self, selector, text, right):
@@ -289,6 +403,7 @@ class ComparisonPanel:
             self.data = data
             self.initial_filters = []
             self.initial_names = None
+            self.models,self._suggestion_cache = {},{}
             self.prediction_mapping,self.offset_mapping = None,{}
             self.offsets = dict(reference_offset=None,candidate_offset=None)
             self.configure()
@@ -394,7 +509,190 @@ class ComparisonPanel:
         details = w.Tab(children=[_table(tables[key],label) for key,label in labels])
         for index,(_,label) in enumerate(labels):
             details.set_title(index,label)
-        return w.VBox([note,_table(tables['summary'],'Temporal coverage'),_image(figure),_image(event_figure),details])
+        return w.VBox([note,_guidance(temporal_interpretation(tables,unit=result.unit)),
+                       _table(tables['summary'],'Temporal coverage'),_image(figure),_image(event_figure),details])
+
+    def trade_settings(self):
+        # CONFIGURATION LOGIC: Record plotting choices with the applied comparison and its exports.
+        if not self.trade_enabled.value:
+            return None
+        return replace(self._trade_config,frequency=self.trade_frequency.value,min_count=self.minimum.value,
+                       max_points=self.trade_max_points.value,side_column=self.trade_side.value,
+                       counterparty_column=self.trade_counterparty.value,dealer_column=self.trade_dealer.value,
+                       quantity_column=self.trade_quantity.value)
+
+    def trade_view(self, result, settings):
+        # UI LOGIC: Intraday summaries and sampled point plots reuse predictions and never fit a model.
+        if settings is None:
+            return w.HTML('<p class="analysis-help">Enable Trade-level views, then Apply. A timestamp is needed only for the time axis and intraday bins. '
+                          'Optional role columns make buy/sell, dealer and quantity visible. Filter to one instrument for a readable trade sequence.</p>')
+        from . import trade_plots
+        tables = result.trade_diagnostics(settings)
+        options = dict(reference_name=result.reference_name,candidate_name=result.candidate_name,unit=result.unit)
+        button = w.Button(description='Show interactive trade points',button_style='info')
+        interactive = w.HTML('<p class="analysis-help">Interactive hover shows trade attributes; click above to load it. The static figures remain available without Plotly.</p>')
+        def show_interactive(_):
+            # PLOTTING LOGIC: Embed a standalone figure on demand; script execution is isolated in its own frame.
+            button.disabled = True
+            try:
+                figure = trade_plots.trade_interactive(tables,**options)
+                document = figure.to_html(full_html=True,include_plotlyjs=True)
+                interactive.value = '<iframe title="Interactive trade predictions" sandbox="allow-scripts allow-downloads" style="width:100%;height:1050px;border:0" srcdoc="'+escape(document,quote=True)+'"></iframe>'
+            except Exception as exc:
+                interactive.value = '<p class="analysis-help">Interactive view unavailable: '+escape(str(exc))+'. Static charts and complete tables remain available.</p>'
+            finally:
+                button.disabled = False
+        button.on_click(show_interactive)
+        note = w.HTML('<p class="analysis-help">Error-by-interval metrics use all paired records. Trade points are a reproducible bounded sample. '
+                      'No interpolation fills inactive intervals. Actual and model spread levels share the source-data scale; errors use the configured error scale. '
+                      'Mixed instruments can have different spread levels: filter by Entity ID to inspect one trajectory.</p>')
+        return w.VBox([note,_table(tables['summary'],'Trade view coverage'),
+                       _image(trade_plots.intraday_figure(tables,**options)),_image(trade_plots.trade_figure(tables,**options)),
+                       row(button),interactive,disclosure('Interval metrics and plotted records',
+                       _table(tables['intraday'],'Interval metrics'),_table(tables['points'],'Plotted records'))])
+
+    def explanation_view(self, result):
+        # UI LOGIC: Feature explanations are separate explicit actions on the last applied records and fitted models.
+        if not result.models:
+            return w.HTML('<p class="analysis-help">Feature explanations require fitted model objects and their input columns. '
+                          'Pass the result of compare_models() or compare_model_set() to show_comparison(). '
+                          'Prediction-only tables support every error diagnostic, but cannot reconstruct model internals or rerun perturbed predictions.</p>')
+        preferred = result.candidate_name if result.candidate_name in result.models else next(iter(result.models))
+        choices = [(name,name) for name in result.models]
+        if result.reference_name in result.models and result.candidate_name in result.models:
+            choices.insert(0,('Both applied models',None))
+        model = w.Dropdown(description='Explain model:',options=choices,value=preferred)
+        population = w.Dropdown(description='Explanation records:',options=[('Paired comparison records','paired'),('All filtered records for this model','model')])
+        maximum = w.BoundedIntText(description='Maximum sampled records:',value=500,min=1,max=50000)
+        shap_sample = w.Dropdown(description='SHAP record selection:',options=[('Reproducible random sample','random'),('Largest absolute errors','worst')])
+        repeats = w.BoundedIntText(description='Permutation repeats:',value=5,min=1,max=100)
+        metric = w.Dropdown(description='Permutation metric:',options=[('MAE','mae'),('RMSE','rmse')])
+        shuffle = w.Dropdown(description='Shuffle within column:',options=[('All selected records',None)]+[(str(c),c) for c in result.data.columns])
+        groups = w.Textarea(description='Feature groups:',placeholder='Quote group = quote_level, quote_age\nActivity group = recent_count, last_trade_age')
+        individuals = w.Checkbox(value=True,description='Also test individual features')
+        permutation = w.Button(description='Compute permutation importance',button_style='primary')
+        shap = w.Button(description='Compute SHAP',button_style='info')
+        progress = w.HTML('<p class="analysis-help">Uses the last applied population, even if the comparison controls above have pending changes. No model is retrained.</p>')
+        output = w.VBox()
+        controls = [model,population,maximum,shap_sample,repeats,metric,shuffle,groups,individuals,permutation,shap]
+        for item in controls:
+            control(item,wide=item is groups)
+        def report_progress(state):
+            # UI LOGIC: Report completed prediction batches rather than presenting a silent long-running action.
+            progress.value = badge(f'{state.get("stage","Working")} · {state.get("completed",0):,} / {state.get("total",0):,}','busy')
+        def calculate(kind):
+            # UI LOGIC: Keep expensive explanations behind separate buttons; failed requests retain earlier outputs.
+            if self.busy:
+                return
+            self._set_busy(True)
+            for item in controls:
+                item.disabled = True
+            # CACHEING LOGIC: Publish explanation caches atomically with the rendered panels, including both-model requests.
+            previous_explanations = dict(result.explanations)
+            try:
+                names = [result.reference_name,result.candidate_name] if model.value is None else [model.value]
+                if len(names) > 1 and population.value != 'paired':
+                    raise ValueError('Choose Paired comparison records when explaining both models so they use the same evaluation population.')
+                selected_groups = self.feature_groups(groups.value) if kind == 'permutation' else None
+                self.validate_feature_groups(result,names,selected_groups)
+                self.status.value = f'Computing {escape(kind)} for the last applied '+escape(', '.join(names))+' records…'
+                positions = self.worst_explanation_positions(result,names[-1],population.value,maximum.value) if kind == 'SHAP' and shap_sample.value == 'worst' else None
+                panels = []
+                for name in names:
+                    common = dict(model=name,population=population.value,max_rows=maximum.value,progress=report_progress)
+                    if kind == 'permutation':
+                        explanation = result.permutation_importance(**common,groups=selected_groups,
+                            include_individual=individuals.value,metric=metric.value,repeats=repeats.value,shuffle_within=shuffle.value)
+                    else:
+                        explanation = result.shap_values(**common,row_positions=positions)
+                        explanation.settings['record_selection'] = shap_sample.value
+                    panels.append(section(name,*self.explanation_result(explanation,kind),note='Feature contributions describe this fitted model and the applied records.'))
+                output.children = panels
+                progress.value = badge('Complete · included in the next applied review export','ready')
+                self.status.value = 'Feature explanation complete. Results describe the last applied population; no model was fitted.'
+            except Exception as exc:
+                # CACHEING LOGIC: A failed later model or plot must not replace only part of the applied export state.
+                result.explanations.clear()
+                result.explanations.update(previous_explanations)
+                progress.value = '<b>Explanation error:</b> '+escape(str(exc))
+                self.status.value = progress.value+' Earlier explanation results remain available.'
+            finally:
+                for item in controls:
+                    item.disabled = False
+                self._set_busy(False)
+        permutation.on_click(lambda _:calculate('permutation'))
+        shap.on_click(lambda _:calculate('SHAP'))
+        help_text = w.HTML('<div class="analysis-help"><p><b>SHAP</b> decomposes model predictions into feature contributions; large contributions do not prove accuracy gains. '
+                          'The offset added back to a residual model is reported separately. Random mode summarizes a sample; Largest absolute errors selects from the complete applied population. '
+                          'For Both applied models, worst-error selection uses the applied candidate and explains those same rows for both models. '
+                          'Attribution differences do not establish accuracy differences.</p>'
+                          '<p><b>Permutation</b> measures error increase after shuffling a feature or feature group. Positive increases indicate model reliance. '
+                          'Correlated features can substitute for each other: enter a group to shuffle its columns together. '
+                          'Shuffling can create unrealistic combinations; use a meaningful within-column restriction if needed. This is not a causal effect or a retraining ablation.</p>'
+                          '<p>Use validation data for exploratory feature decisions. Sampled importance is conditional on the applied filters; it does not establish full-population improvement. '
+                          'Groups use one line per group: <code>Group name = feature_a, feature_b</code>.</p></div>')
+        return w.VBox([help_text,row(model,population,maximum),row(shap_sample),row(repeats,metric,shuffle),
+                       disclosure('Grouped permutation settings',row(groups),row(individuals)),row(permutation,shap),progress,output])
+
+    def feature_groups(self, text):
+        # CONFIGURATION LOGIC: Parse explicit feature names; this accepts no Python expressions or regular expressions.
+        groups = {}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            name, separator, values = line.partition('=')
+            columns = [value.strip() for value in values.split(',') if value.strip()]
+            if not separator or not name.strip() or not columns:
+                raise ValueError('Each feature group must look like: Quote features = quote_level, quote_age')
+            if name.strip() in groups:
+                raise ValueError('Feature group names must be unique.')
+            groups[name.strip()] = columns
+        return groups or None
+
+    def validate_feature_groups(self, result, names, groups):
+        # VALIDATION LOGIC: A shared group must exist in every selected model; missing features are never silently discarded.
+        for name in names:
+            for group, columns in (groups or {}).items():
+                missing = set(columns)-set(result.models[name].features)
+                if missing:
+                    raise ValueError(f'{name}: group {group!r} contains unavailable features {sorted(missing)}. Select one model or edit the group.')
+
+    def worst_explanation_positions(self, result, name, population, limit):
+        # CORE LOGIC: STEP 1 — Use the identical positional population accepted by the explanation API.
+        # Input: source x=[10,20,30], source index=[7,7,9], paired positions=[0,2], population='paired';
+        # name='B', prediction_columns={'B':'prediction'}, prediction_offsets={'B':'offset'}.
+        # Output: selected x=[10,30], selected index=[7,9], column='prediction', offset='offset'; local positions are 0 and 1.
+        # Explanation: Local record positions refer to the filtered explanation input, not the original table index.
+        # Trick: iloc avoids reintroducing an excluded row when source index labels repeat.
+        frame = result.data.iloc[result.rows['__source_position']] if population == 'paired' else result.data
+        column, offset = result.prediction_columns[name], result.prediction_offsets.get(name)
+        # CORE LOGIC: STEP 2 — Rank cached final-level errors without predicting again or including missing targets.
+        # Input: actual=[100,100,100], raw prediction=[1,4,-2], offset=[100,100,100], error_scale=1, limit=2.
+        # Output: row_positions=[1,2], from absolute final errors [1,4,2].
+        # Explanation: Reuse candidate-error preparation to keep finite-error validation and offset reconstruction consistent.
+        # Trick: Stable sorting breaks equal-error ties by source order; worst cases are not a representative population sample.
+        rows = prepare_candidate_rows(frame,result.config['actual'],column,
+            candidate_offset=offset,error_scale=result.config['error_scale'])
+        return rows.sort_values('__ae_candidate',ascending=False,kind='stable')['__source_position'].head(limit).tolist()
+
+    def explanation_result(self, explanation, kind):
+        # PLOTTING LOGIC: Show global importance plus an explicit local record selector for SHAP contributions.
+        from . import explanation_plots
+        notes = w.HTML('<p class="analysis-help">'+'<br>'.join(escape(str(note)) for note in explanation.notes)+'</p>')
+        tables = disclosure('Complete explanation tables',*[_table(table,name.replace('_',' ').title()) for name,table in explanation.tables.items()])
+        if kind == 'permutation':
+            return [notes,_image(explanation_plots.plot_permutation(explanation)),tables]
+        local = explanation.tables['local_contributions']
+        positions = list(dict.fromkeys(local['row_position']))
+        selector = w.Dropdown(description='Local record position:',options=positions)
+        chart = w.VBox()
+        def update_local(_=None):
+            # PLOTTING LOGIC: Reuse stored contributions instead of rerunning SHAP when changing the displayed record.
+            if selector.value is not None:
+                chart.children = [_image(explanation_plots.plot_shap_local(explanation,row_position=selector.value))]
+        selector.observe(update_local,names='value')
+        update_local()
+        return [notes,_image(explanation_plots.plot_shap_global(explanation)),row(control(selector)),chart,tables]
 
     def run(self, _=None):
         # UI LOGIC: Publish result state only after a successful computation; previous exports remain valid.
@@ -406,11 +704,14 @@ class ComparisonPanel:
             if self.data is None:
                 raise ValueError('Load data first.')
             reference,candidate = self.reference.value,self.candidate.value
+            if reference == candidate:
+                raise ValueError('Choose two different models, or use Swap models to reverse the current pair.')
             result = compare_predictions(self.data,self.actual.value,self.mapping[reference],self.mapping[candidate],
                                          reference_name=reference,candidate_name=candidate,id_column=self.identity.value,
                                          time_column=self.time.value,entity_column=self.entity.value,error_scale=self.scale.value,
                                          unit=self.unit.value,timezone=self.zone.value,tolerance=self.tolerance.value,
                                          reference_offset=self.offset_mapping.get(reference),candidate_offset=self.offset_mapping.get(candidate))
+            result.models,result.prediction_columns,result.prediction_offsets = dict(self.models),dict(self.mapping),dict(self.offset_mapping)
             result.filter_history = list(self.initial_filters)
             filters = []
             for item in self.filters:
@@ -418,8 +719,9 @@ class ComparisonPanel:
                 if item['column'].value is not None and has_condition:
                     options = dict(minimum=float(item['low'].value) if item['low'].value.strip() else None,
                                    maximum=float(item['high'].value) if item['high'].value.strip() else None,
-                                   values=[v.strip() for v in item['categories'].value.split(';')] if item['categories'].value.strip() else None,
-                                   minimum_inclusive=not item['strict'].value)
+                                   values=[v.strip() for v in item['categories'].value.split(';') if v.strip()] if item['categories'].value.strip() else None,
+                                   minimum_inclusive=not item['strict'].value,match=item['match'].value,
+                                   case_sensitive=item['case_sensitive'].value)
                     result = result.filter(item['column'].value,**options)
                     filters.append(dict(column=item['column'].value,**options))
             first,second = self.specs()
@@ -429,22 +731,25 @@ class ComparisonPanel:
             inference = result.inference_config(inference)
             population,min_count,metric = self.candidate_population.value,self.minimum.value,self.metric.value
             temporal = self.temporal_settings()
+            trades = self.trade_settings()
             candidate_count = result.coverage['candidate_evaluable'] if population == 'candidate' else len(result.rows)
             if not candidate_count and result.rows.empty:
                 raise ValueError(f'No finite candidate records in the selected diagnostic population. Coverage: {result.coverage}')
             title = f'{candidate} vs {reference} | {first.column}'+(f' × {second.column}' if second else '')
             views = self.paired_views(result,first,second,inference,min_count,metric,title)
             views += [self.candidate_view(result,first,second,population,min_count,self.top_n.value),
-                      self.temporal_view(result,temporal,population),_table(result.missingness(),'Input missingness')]
+                      self.temporal_view(result,temporal,population),self.trade_view(result,trades),
+                      self.explanation_view(result),_table(result.missingness(),'Input missingness')]
             # UI LOGIC: Publish the complete view and its matching export state only after every calculation succeeds.
             self.views.children = views
-            for i,label in enumerate(['Overview','Slices','Dates','Candidate','Time series','Missingness']):
+            for i,label in enumerate(['Overview','Slices','Dates','Candidate','Time series','Trade points','Feature explanations','Missingness']):
                 self.views.set_title(i,label)
             self.result,self.applied_specs = result,(first,second)
             self.applied_filters,self.applied_min_count = result.filter_history,min_count
             self.applied_metric,self.applied_inference = metric,inference
             self.applied_candidate_population = population
             self.applied_temporal = temporal
+            self.applied_trades = trades
             self.applied_top_n = self.top_n.value
             self._applied_control_state = self._control_state()
             self.export_button.disabled = False
@@ -470,7 +775,7 @@ class ComparisonPanel:
             output = self.result.export(self.export_path.value,slices=[first],interactions=[(first,second)] if second else [],
                                         min_count=self.applied_min_count,metric=self.applied_metric,inference=self.applied_inference,
                                         include_candidate=True,candidate_population=self.applied_candidate_population,candidate_top_n=self.applied_top_n,
-                                        temporal=self.applied_temporal,temporal_population=self.applied_candidate_population)
+                                        temporal=self.applied_temporal,temporal_population=self.applied_candidate_population,trades=self.applied_trades)
             self.status.value = 'Saved complete PNG, CSV and HTML review to '+escape(str(output))
         except Exception as exc:
             self.status.value = '<b>Export error:</b> '+escape(str(exc))

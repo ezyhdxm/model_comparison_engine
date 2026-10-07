@@ -1,6 +1,6 @@
 # Model Comparison Engine
 
-Compare **any two scalar regression models** on the same evaluation records. Start with prediction columns, or pass two fitted estimators and their respective feature lists. Inspect overall errors, arbitrary slices, two-column heatmaps, paired statistical evidence, candidate residuals, coverage, date sensitivity and optional residual timing. Export calculated HTML, CSV and complete PNG reports. The v0.4 workbench groups setup into readable sections, marks pending edits and wraps long chart labels without hiding categories.
+Compare **any two scalar regression models** on the same evaluation records. Supply any number of prediction columns or fitted estimators, then switch the selected pair without repeating inference. Inspect overall errors, arbitrary slices, two-column heatmaps, paired statistical evidence, residuals and coverage. Version 0.5 adds fitted-model SHAP and permutation explanations, searchable text filters, evidence-linked temporal reading guides, intraday comparisons and trade-level prediction plots. Export calculated HTML, CSV, complete PNG and optional offline interactive plots.
 
 The package is independent of a particular dataset, industry, estimator library or training pipeline. It has no hardcoded business fields or thresholds. All shipped examples are generated synthetic data; no private records, models or historical result artifacts are included.
 
@@ -87,6 +87,16 @@ comparison = compare_models(
 - Immutable local review bundles with configuration, filter history and input fingerprint.
 - Notebook controls export the last **applied** result, not pending edits.
 - Optional expanding/rolling walk-forward fitting with fold-local preprocessing, label-availability purging and an excluded final holdout.
+- Cached multi-model selection, model-specific reconstruction offsets and memory-only fitted-model retention.
+- Individual/grouped/context-restricted permutation importance and checked TreeSHAP with local worst-case explanations.
+- Searchable categorical suggestions and literal contains/prefix/suffix filters, with explicit case sensitivity.
+- Auto-resolution intraday errors plus actual/reference/candidate points; map side, counterparty/dealer and quantity explicitly.
+
+For a complete fitted LightGBM demonstration, open [fitted_model_review.ipynb](fitted_model_review.ipynb).
+All demo data are synthetic, and its separate training cell creates demonstration models only.
+Install `python -m pip install -e ".[notebook,interactive]" lightgbm` for that notebook.
+Native LightGBM TreeSHAP does not need the `shap` package; other supported tree models use `.[explain]`.
+See [explanations](docs/EXPLANATIONS.md), [trade plots](docs/TRADES.md) and [all usage options](docs/USAGE.md).
 
 ## Optional walk-forward cross-validation
 

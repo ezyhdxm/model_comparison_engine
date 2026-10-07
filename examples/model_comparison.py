@@ -25,7 +25,7 @@ timing = TemporalConfig(frequency="1D", signal="bias", rolling_bins=10, max_lag=
 #
 # Choose model roles, metadata slices, numerical bins, interactions and statistical settings. Auto uses equally weighted date means when time is configured, otherwise records. Explicit record, date and entity units are available. Negative t favors the candidate; absolute and squared loss are supported. Both minimum records and minimum units must pass.
 #
-# The v0.4 workbench groups setup into sections, shows a pending-edit badge and wraps long chart labels. Expand the optional time-series controls to change the daily interval, signal and support.
+# The v0.5 workbench groups setup into sections, explains option meanings and shows a pending-edit badge. It supports partial text filters, intraday points and model explanations when fitted models are supplied. Expand the time-series controls to change the interval, signal and support.
 #
 # Apply freezes the pair, filters, bins, test settings, candidate population and enabled temporal configuration. Editing controls changes the next Apply; exports preserve the last applied choices. Open Slices → Significance for tests, Candidate for residual plots, and Time series for the enabled timing diagnostics. UTC and generic units are defaults, not assumptions about your own data.
 
@@ -127,5 +127,10 @@ report_folder = comparison.export("reports/notebook_demo", slices=["segment",mea
 # For residual predictions, use `reference_offset="known_level"` and/or `candidate_offset="other_known_level"`. Actual 105, residual prediction 2 and offset 100 give reconstructed prediction 102 and error −3 at scale 1. Offsets must be known at prediction time and stay attached to their model when UI roles change.
 #
 # For two fitted estimators, use `compare_models(data, actual=..., reference=Model(...), candidate=Model(...))`. Each `Model` supplies its own ordered features and optional additive offset. See `docs/USAGE.md` for the complete contract.
+#
+# Version 0.5 also supports any number of named predictions/models, partial text filters, intraday plots,
+# and explicit fitted-model explanation buttons. See `fitted_model_review.ipynb` for the complete synthetic
+# LightGBM example, including SHAP and grouped permutation importance. Prediction-only inputs keep all
+# error diagnostics but cannot provide feature attributions or perturbed model predictions.
 #
 # Generated reports retain your supplied labels. This repository's neutral examples do not automatically anonymize a new dataset.
