@@ -2,6 +2,8 @@
 
 Compare **any two scalar regression models** on the same evaluation records. Supply any number of prediction columns or fitted estimators, then switch the selected pair without repeating inference. Inspect overall errors, arbitrary slices, two-column heatmaps, paired statistical evidence, residuals and coverage. Version 0.5 adds fitted-model SHAP and permutation explanations, searchable text filters, evidence-linked temporal reading guides, intraday comparisons and trade-level prediction plots. Export calculated HTML, CSV, complete PNG and optional offline interactive plots.
 
+Trade plots default to signed prediction errors, so differences between instruments' target levels do not hide errors. Switch to a single entity or to within-entity deviations, with the same observed mean removed from actual and both predictions. Side codes use stable colors and quantities control point size; every view records its target, units and sampling coverage.
+
 The package is independent of a particular dataset, industry, estimator library or training pipeline. It has no hardcoded business fields or thresholds. All shipped examples are generated synthetic data; no private records, models or historical result artifacts are included.
 
 ## Install and try
@@ -90,7 +92,7 @@ comparison = compare_models(
 - Cached multi-model selection, model-specific reconstruction offsets and memory-only fitted-model retention.
 - Individual/grouped/context-restricted permutation importance and checked TreeSHAP with local worst-case explanations.
 - Searchable categorical suggestions and literal contains/prefix/suffix filters, with explicit case sensitivity.
-- Auto-resolution intraday errors plus actual/reference/candidate points; map side, counterparty/dealer and quantity explicitly.
+- Auto-resolution intraday errors and separate actual-versus-model panels; mapped side uses stable colors, quantity controls point size, and dealer/counterparty remain in hover details.
 
 For a complete fitted LightGBM demonstration, open [fitted_model_review.ipynb](fitted_model_review.ipynb).
 All demo data are synthetic, and its separate training cell creates demonstration models only.

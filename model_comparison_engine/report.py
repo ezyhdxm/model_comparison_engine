@@ -142,12 +142,17 @@ def _trade_section(comparison, output, tables, settings):
     trade_figure(diagnosis, **labels).savefig(output/'trade_predictions.png', dpi=160)
     intraday_figure(diagnosis, **labels).savefig(output/'trade_time_bins.png', dpi=160)
     section = '<h2 id="trades">Predictions, observed records and intraday errors</h2>'
-    section += _table(diagnosis['summary'])+_figure('trade_time_bins.png','Paired errors in elapsed-time bins')
-    section += _figure('trade_predictions.png','Observed and predicted levels; marker metadata and displayed sample')
-    section += '<p>Level axes use original target units; error axes use the declared error scale. '
-    section += 'Marker shapes, colours and size retain the supplied metadata meanings. No buy/sell direction is inferred. '
-    section += 'Unknown/nonpositive quantity remains visible. Plot sampling does not change error metrics. '
-    section += 'Filter to one entity to compare its level through time; a mixed-entity cloud contains different baseline levels.</p>'
+    summary = diagnosis['summary'].iloc[0]
+    section += '<p><b>Target:</b> '+escape(str(summary['actual_column']))+' · <b>Point view:</b> '+escape(str(summary['point_view']))
+    section += ' · <b>Entity focus:</b> '+escape(str(summary['focus_entity']) if settings.focus_entity is not None else 'All applied paired records')+'</p>'
+    section += '<p>'+escape(str(summary['view_note']))+'</p>'
+    section += '<details><summary>Complete trade-view coverage and settings</summary>'+_table(diagnosis['summary'])+'</details>'
+    section += _figure('trade_time_bins.png','Paired errors in elapsed-time bins')
+    section += _figure('trade_predictions.png','Requested target diagnostic; category colors, quantity sizes and displayed sample')
+    section += '<p>Residual and within-entity axes use the configured error unit; level axes retain source target units. '
+    section += 'Side codes D/B/S use purple/blue/orange; no buy/sell convention is inferred. Quantity controls point size. '
+    section += 'Unknown/nonpositive quantity stays visible. Plot sampling does not change error metrics. '
+    section += 'Entity focus restricts this section only; other report sections retain their applied population.</p>'
     # FILE IO LOGIC: The optional interactive view embeds its JavaScript locally and makes no network request.
     try:
         figure = trade_interactive(diagnosis, **labels)

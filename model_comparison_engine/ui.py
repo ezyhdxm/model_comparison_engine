@@ -61,6 +61,41 @@ def _guidance(table):
     return w.HTML('<div class="analysis-guidance">'+''.join(cards)+'</div>')
 
 
+def _trade_summary(tables):
+    # UI LOGIC: Present already-computed coverage as wrapping cards rather than a single wide metadata row.
+    summary, settings = tables['summary'].iloc[0], tables['settings']
+    count = lambda key: f'{int(summary[key]):,}'
+    color = settings['side_column'] or settings['dealer_column'] or settings['counterparty_column'] or 'No category column supplied'
+    quantity = settings['quantity_column'] or 'Not supplied: uniform minimum marker area'
+    color_note = ('Supplied side codes D, B and S use purple, blue and orange; their meaning is not inferred.' if settings['side_column'] else
+                  'No side column is mapped; dealer, then counterparty, supplies fallback category colors when available.')
+    view = settings.get('point_view','residual')
+    view_labels = {'residual':'Prediction minus actual · '+str(summary['error_unit']),
+                   'within_entity':'Deviation from the same entity mean actual · '+str(summary['error_unit']),
+                   'level':'Original target level · source target units'}
+    marks = ('Residuals use x markers; the zero line means an exact prediction.' if view == 'residual' else
+             'Actual values use hollow circles; predictions use x markers.')
+    focus = 'All applied paired records' if settings.get('focus_entity') is None else 'Exact entity: '+str(settings['focus_entity'])
+    sampled = f"{int(summary.get('sampled_rows',summary['plotted_rows'])):,}"
+    cards = [
+        ('Evaluation records', ['Actual column: '+str(summary.get('actual_column','the configured Actual column'))+'. '+focus+'.',
+            count('paired_rows')+' paired records in this trade view; '+f"{int(summary.get('input_paired_rows',summary['paired_rows'])):,}"+' paired records in the applied comparison.',
+            count('timed_rows')+' have timestamps; '+count('missing_time_rows')+' have no usable timestamp. Untimed records can still appear in prediction-versus-actual plots.']),
+        ('Displayed points', [view_labels[view]+'. '+sampled+' sampled records; '+count('plotted_rows')+' have drawable coordinates.',
+            ('Seeded uniform sample, seed '+str(summary['random_state'])+'.' if summary['sampled'] else 'Every paired record is included in the point sample.')+
+            ' Sampling changes the point chart only; interval metrics use all timestamped paired records in this focus.',
+            str(summary.get('view_note','Residuals expose prediction error without pooling unrelated instruments into a level-fit chart.'))]),
+        ('Time-bin coverage', [str(summary['frequency'])+' intervals · '+str(summary['timezone'])+' labels · '+count('local_dates')+
+            ' occupied local dates across '+count('calendar_span_days')+' calendar days.',
+            count('supported_bins')+' of '+count('total_bins')+' bins meet minimum N='+count('min_count')+'; '+count('empty_bins')+' bins are empty.',
+            'Nights, weekends and other empty intervals remain gaps, not zero errors. Record-count bars show the observations behind each interval.']),
+        ('Point encodings', ['Color: '+str(color)+'. '+color_note,
+            marks+' Separate panels show each model. Quantity: '+str(quantity)+'. Dealer and counterparty remain exact hover metadata.']),
+    ]
+    body = ''.join('<article class="analysis-guidance-card"><h4>'+escape(title)+'</h4>'+''.join('<p>'+escape(text)+'</p>' for text in paragraphs)+'</article>' for title, paragraphs in cards)
+    return w.HTML('<div class="analysis-guidance">'+body+'</div>')
+
+
 def _filter_text(condition):
     # UI LOGIC: Present the recorded population in readable terms instead of a Python configuration dict.
     column, parts = condition['column'], []
@@ -166,6 +201,7 @@ class ComparisonPanel:
         self.views = w.Tab(children=[w.HTML('Apply to calculate the common sample.')])
         self.views.set_title(0,'Results')
         self._make_widget()
+        self.entity.observe(self._refresh_trade_entities,names='value')
         self.first.observe(lambda _:self.set_bins(self.first,self.first_bins,self.first_right),names='value')
         self.second.observe(lambda _:self.set_bins(self.second,self.second_bins,self.second_right),names='value')
         if self.data is not None:
@@ -220,9 +256,16 @@ class ComparisonPanel:
             w.HTML('<p class="analysis-help">Enable before Apply to inspect trends, rolling errors, autocorrelation, spectral peaks and changes. '
                    'Requires a timestamp column. These diagnostics describe the selected records.</p>'))
         trade_controls = disclosure('Trade-level and intraday views',row(self.trade_enabled,self.trade_frequency,self.trade_max_points),
+            row(self.trade_point_view,self.trade_entity),self.trade_entity_help,
             row(self.trade_side,self.trade_counterparty,self.trade_dealer,self.trade_quantity),
-            w.HTML('<p class="analysis-help">Compare actual and reconstructed predictions at individual trade times. '
+            w.HTML('<p class="analysis-help"><b>Residual</b> is the default: prediction minus actual in the configured error unit, with zero meaning an exact prediction. '
+                   '<b>Within entity</b> subtracts the same entity\'s mean actual value from both actual and predictions, using all focused paired records before sampling, then applies Error scale. '
+                   'This retrospective centering is a diagnostic, not a model feature. <b>Level</b> uses original target units; pooled bonds with very different levels can create a misleading impression of fit. '
+                   'Focus entity affects only Trade points, its interval summaries and their exports; other tabs keep the applied population. '
                    'Map optional transaction-side, counterparty type, dealer ID and quantity columns explicitly; these describe records and are not inferred from model names. '
+                   'The side column controls color: supplied D/B/S codes use purple/blue/orange, with no automatic interpretation of their meaning. '
+                   'Residuals use x markers and a zero-error line. Within-entity and level views use hollow circles for actuals and x markers for predictions, with separate panels per model. '
+                   'Quantity controls marker size, while dealer and counterparty remain available in hover. '
                    'Auto interval uses 30 minutes for a span of up to 3 local days, 1 hour for up to 14, otherwise daily. '
                    'The point chart uses a reproducible bounded sample; interval metrics use all paired records.</p>'))
         filters = disclosure('Optional population filters',*[item['widget'] for item in self.filters],
@@ -251,7 +294,8 @@ class ComparisonPanel:
                  'first','second','first_bins','second_bins','first_right','second_right','minimum','top_n','metric']
         names += ['loss','test_unit','correction','alpha','min_units','candidate_population',
                   'temporal_enabled','temporal_frequency','temporal_signal','temporal_rolling','temporal_min_count','temporal_max_lag']
-        names += ['trade_enabled','trade_frequency','trade_max_points','trade_side','trade_counterparty','trade_dealer','trade_quantity']
+        names += ['trade_enabled','trade_frequency','trade_max_points','trade_side','trade_counterparty','trade_dealer','trade_quantity',
+                  'trade_point_view','trade_entity']
         self._pending_controls = [getattr(self,name) for name in names]
         self._pending_controls += [item[key] for item in self.filters for key in ['column','low','high','strict','categories','match','case_sensitive']]
         for item in self._pending_controls:
@@ -271,8 +315,49 @@ class ComparisonPanel:
         self.trade_enabled = w.Checkbox(value=True,description='Include trade-level views')
         self.trade_frequency = w.Dropdown(description='Comparison interval:',options=frequencies,value=self._trade_config.frequency)
         self.trade_max_points = w.BoundedIntText(description='Maximum plotted trades:',value=self._trade_config.max_points,min=1,max=100000)
+        self.trade_point_view = w.Dropdown(description='Point view:',options=[('Residual: prediction minus actual','residual'),
+            ('Within entity: common actual mean','within_entity'),('Level: original target units','level')],
+            value=getattr(self._trade_config,'point_view','residual'))
+        self.trade_entity = w.Dropdown(description='Focus entity (trade tab only):',options=[('All applied paired records',None)])
+        self.trade_entity_help = w.HTML()
+        self._trade_entity_counts_result,self._trade_entity_counts_data_id = None,None
         self.trade_side,self.trade_counterparty,self.trade_dealer,self.trade_quantity = [w.Dropdown(description=label) for label in
-            ['Buy / sell column:','Counterparty type column:','Dealer ID column:','Quantity column:']]
+            ['Side / color column:','Counterparty type column:','Dealer ID column:','Quantity / size column:']]
+
+    def _refresh_trade_entities(self, change=None, *, comparison=None, initial=False):
+        # UI LOGIC: Entity options keep exact source values; string labels are presentation only.
+        column = self.entity.value
+        desired = getattr(self._trade_config,'focus_entity',None) if initial else self.trade_entity.value
+        if change is not None:
+            desired = None
+        if self.data is None or column is None or column not in self.data:
+            self.trade_entity.options = [('All applied paired records',None)]
+            self.trade_entity_help.value = '<p class="analysis-help">Choose Entity ID above to focus this trade view on one exact instrument or issuer.</p>'
+            return
+        if comparison is not None:
+            self._trade_entity_counts_result,self._trade_entity_counts_data_id = comparison,id(self.data)
+        applied = self._trade_entity_counts_result
+        available = applied is not None and self._trade_entity_counts_data_id == id(self.data) and applied.config['entity_column'] == column
+        # CORE LOGIC: STEP 1 — Order all known entities by their usable paired counts when a comparison exists.
+        # Input: supplied entities=['A','A','B','B','C'], applied paired entities=['B','A','B'].
+        # Output: selector counts in order={'B':2,'A':1,'C':0}; no supplied entity is truncated.
+        # Explanation: Before the first Apply, supplied counts are shown instead and explicitly labeled as such.
+        # Trick: Reindex retains entities with zero paired records; option values preserve their original data types.
+        supplied = self.data[column].value_counts(dropna=True)
+        supplied = supplied.loc[supplied.gt(0)]
+        counts = applied.rows[column].value_counts(dropna=True).reindex(supplied.index,fill_value=0) if available else supplied
+        counts = counts.sort_values(ascending=False,kind='stable')
+        # UI LOGIC: Changing the display order must not change an already selected exact-value focus.
+        scope = 'paired' if available else 'supplied'
+        options = [('All applied paired records',None)]+[(f'{value} · {int(number):,} {scope} records',value) for value,number in counts.items()]
+        if desired is not None and desired not in counts.index:
+            options.append((f'{desired} · absent from loaded data',desired))
+        self.trade_entity.options = options
+        self.trade_entity.value = desired
+        self.trade_entity_help.value = ('<p class="analysis-help">All '+str(len(counts))+' nonmissing values of <b>'+escape(str(column))+
+            '</b> are selectable; values are matched exactly without converting numeric IDs to text. Counts use '+
+            ('the last successfully applied paired population.' if available else 'the supplied data until the first Apply.')+
+            ' Missing entity IDs remain in the all-records view. Changes take effect on Apply.</p>')
 
     def _control_state(self):
         # UI LOGIC: Compare literal widget values plus the loaded-table identity; export-path edits are independent.
@@ -381,6 +466,7 @@ class ComparisonPanel:
             value = getattr(self._trade_config,name)
             selector.options = [('Not supplied',None)]+[(str(c),c) for c in columns]
             selector.value = value if value in columns else None
+        self._refresh_trade_entities(initial=True)
         self.model_help.value = ('<p class="analysis-help"><b>'+str(len(mapping))+' selectable prediction series:</b> '+
                                  ', '.join(escape(str(name)) for name in mapping)+'. '+
                                  ('Fitted model objects are attached; feature explanations are available.' if self.models else
@@ -519,7 +605,8 @@ class ComparisonPanel:
         return replace(self._trade_config,frequency=self.trade_frequency.value,min_count=self.minimum.value,
                        max_points=self.trade_max_points.value,side_column=self.trade_side.value,
                        counterparty_column=self.trade_counterparty.value,dealer_column=self.trade_dealer.value,
-                       quantity_column=self.trade_quantity.value)
+                       quantity_column=self.trade_quantity.value,point_view=self.trade_point_view.value,
+                       focus_entity=self.trade_entity.value)
 
     def trade_view(self, result, settings):
         # UI LOGIC: Intraday summaries and sampled point plots reuse predictions and never fit a model.
@@ -543,10 +630,12 @@ class ComparisonPanel:
             finally:
                 button.disabled = False
         button.on_click(show_interactive)
-        note = w.HTML('<p class="analysis-help">Error-by-interval metrics use all paired records. Trade points are a reproducible bounded sample. '
-                      'No interpolation fills inactive intervals. Actual and model spread levels share the source-data scale; errors use the configured error scale. '
-                      'Mixed instruments can have different spread levels: filter by Entity ID to inspect one trajectory.</p>')
-        return w.VBox([note,_table(tables['summary'],'Trade view coverage'),
+        note = w.HTML('<p class="analysis-help">Error-by-interval metrics use all paired records in this trade view\'s optional entity focus. '
+                      'Other comparison tabs retain the globally applied population. Trade points are a reproducible bounded sample. '
+                      'The count panel uses bars: empty calendar intervals are gaps, not drops to zero error. No interpolation fills inactive intervals. '
+                      'Residual and within-entity views use the configured error unit; original-level views use source target units. '
+                      'Within-entity centering uses realized actuals from the focused evaluation sample and is not available as a predictive feature.</p>')
+        return w.VBox([note,_trade_summary(tables),
                        _image(trade_plots.intraday_figure(tables,**options)),_image(trade_plots.trade_figure(tables,**options)),
                        row(button),interactive,disclosure('Interval metrics and plotted records',
                        _table(tables['intraday'],'Interval metrics'),_table(tables['points'],'Plotted records'))])
@@ -745,6 +834,7 @@ class ComparisonPanel:
             for i,label in enumerate(['Overview','Slices','Dates','Candidate','Time series','Trade points','Feature explanations','Missingness']):
                 self.views.set_title(i,label)
             self.result,self.applied_specs = result,(first,second)
+            self._refresh_trade_entities(comparison=result)
             self.applied_filters,self.applied_min_count = result.filter_history,min_count
             self.applied_metric,self.applied_inference = metric,inference
             self.applied_candidate_population = population

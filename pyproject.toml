@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-comparison-engine"
-version = "0.5.0"
+version = "0.5.1"
 description = "Generic regression comparison, paired inference, residual diagnostics and interactive reports"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "pandas>=2.2", "matplotlib>=3.7", "pyarrow>=12", "scipy>=1.15"]

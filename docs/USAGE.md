@@ -208,7 +208,7 @@ test units or repeated exploratory model selection. See [SciPy's method referenc
 from model_comparison_engine import TradeViewConfig
 trade_view = TradeViewConfig(frequency="auto", min_count=10, max_points=2000,
     side_column="side", counterparty_column="counterparty_type", dealer_column="dealer_id",
-    quantity_column="quantity")
+    quantity_column="quantity", point_view="residual", focus_entity=None)
 # UI LOGIC: Applied filters also restrict the point plots and intraday metrics.
 panel = show_comparison(review, trades=trade_view)
 # REPORTING LOGIC: Complete bin statistics and the exact displayed point sample remain available.
@@ -219,10 +219,36 @@ report_folder = review.export("reports", trades=trade_view)
 
 Auto resolution uses the calendar span: up to three days uses 30-minute bins, up to fourteen uses
 hourly bins, and longer spans use daily bins. Explicit intervals are available. Empty/unsupported bins
-remain gaps. Statistical test units are unchanged: finer plotting intervals do not manufacture
+remain gaps, including nights and weekends; they are not drops to zero error. Record-count bars show
+support for each interval. Statistical test units are unchanged: finer plotting intervals do not manufacture
 independent observations. Prediction-versus-actual plots also work without timestamps; time plots require them.
 Point sampling affects only the plots; bin metrics use all paired records. Hover preserves exact
-metadata and prediction values. See [trade view details](TRADES.md).
+metadata and prediction values. The Trade points tab shows compact coverage cards instead of a wide
+one-row metadata table; full summary fields remain available through the API and export.
+
+**Point view defaults to residuals**: prediction minus actual in the configured error unit, with zero
+meaning an exact prediction. This avoids a pooled level plot looking impressive simply because bonds
+trade at very different spread levels. Choose `point_view="within_entity"` to subtract each entity's
+same mean actual value from both actual and predictions, then apply `error_scale`. The mean uses the
+full focused paired cohort before sampling. This removes average level, not volatility; it is a
+retrospective diagnostic using realized outcomes, not a predictive feature. `point_view="level"`
+retains original target units for level inspection.
+
+The **Focus entity (trade tab only)** selector retains exact source ID values and includes all known
+nonmissing IDs, with supplied counts before Apply and last-applied paired counts afterward. Set
+`focus_entity` to the exact source value, such as `"Instrument A"` or numeric `101`, or leave it `None`
+for the full applied paired cohort. This changes only the trade charts and their interval summaries;
+other comparison tabs retain the globally filtered population. Exports preserve the focus and view
+settings. Coverage names the actual target column and distinguishes sampled from drawable records.
+
+In the point plots, **side controls color**. Map the prepared side column with `side_column`, for example
+`side_column="side"`. Supplied `D`/`B`/`S` codes use purple/blue/orange consistently; the engine does not
+translate those codes into a presumed customer/dealer convention. Actual/reference/candidate are
+separated clearly: residual mode uses x markers and a zero-error line, with separate panels for each model.
+Within-entity and level modes use hollow circles for actual values and x markers for predictions.
+Quantity controls marker size. Dealer and counterparty values
+remain exact hover metadata. When no side column is supplied, dealer and then counterparty provide
+fallback category colors. See [trade view details](TRADES.md).
 
 The Time series tab now reports **Observed / Meaning / Next check** alongside computed coverage,
 autocorrelation, spectrum and mean-shift results. These explanations describe actual returned tables;
