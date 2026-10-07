@@ -1,6 +1,7 @@
 """Paired trade views and fixed-clock comparison bins; no prediction or fitting calls."""
 # SETUP LOGIC: Reuse the existing finite paired population and stable metric definitions.
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
+from inspect import signature
 from numbers import Integral
 import numpy as np
 import pandas as pd
@@ -41,6 +42,32 @@ class TradeViewConfig:
             raise ValueError('Use max_categories <= 18 and max_points <= 100000 for bounded trade plots.')
         if isinstance(self.random_state, bool) or not isinstance(self.random_state, Integral) or self.random_state < 0:
             raise ValueError('random_state must be a nonnegative integer.')
+
+
+def normalize_trade_config(settings=None, **changes):
+    """Rebuild settings with the current class, including objects retained across notebook reloads."""
+    # CONFIGURATION LOGIC: Detect a partially reloaded constructor before an opaque unexpected-keyword error.
+    if not {'point_view', 'focus_entity'}.issubset(signature(TradeViewConfig).parameters):
+        raise RuntimeError(f'Trade-view code is only partly updated at {__file__}. Reload trade_view, trade_plots, '
+                           'report, ui and model_comparison_engine in that order, then recreate the comparison panel.')
+    # CONFIGURATION LOGIC: Recover declared settings only; accept this package's earlier dataclass identity.
+    # Input: an old TradeViewConfig(frequency='1h', max_points=37), changes={'point_view':'level'}.
+    # Output: current TradeViewConfig with frequency='1h', max_points=37, point_view='level', focus_entity=None.
+    # Trick: dataclasses.replace invokes the OLD object's constructor. Copy its values into the current class
+    # instead, preserving advanced limits and using current defaults only for fields absent in older versions.
+    if settings is None:
+        values = {}
+    elif isinstance(settings, dict):
+        values = dict(settings)
+    elif (is_dataclass(settings) and not isinstance(settings, type)
+          and (isinstance(settings, TradeViewConfig)
+               or (type(settings).__module__ == __name__ and type(settings).__name__ == 'TradeViewConfig'))):
+        values = {field.name: getattr(settings, field.name) for field in fields(settings) if hasattr(settings, field.name)}
+    else:
+        raise TypeError('settings must be TradeViewConfig, a dictionary or None.')
+    # CONFIGURATION LOGIC: Explicit pending controls override the copied snapshot without mutating the old object.
+    values.update(changes)
+    return TradeViewConfig(**values)
 
 
 def _frequency(times, timezone, requested):
@@ -201,10 +228,7 @@ def _view_coordinates(rows, config, error_scale):
 def trade_tables(comparison, settings=None):
     """Return full paired intraday metrics, sampled points, and an explicit support audit."""
     # CONFIGURATION LOGIC: Caller-selected metadata has no inferred economic meaning.
-    config = TradeViewConfig() if settings is None else settings
-    config = TradeViewConfig(**config) if isinstance(config, dict) else config
-    if not isinstance(config, TradeViewConfig):
-        raise TypeError('settings must be TradeViewConfig, a dict or None.')
+    config = normalize_trade_config(settings)
     for column in (config.side_column, config.counterparty_column, config.dealer_column, config.quantity_column):
         if column is not None and column not in comparison.rows:
             raise ValueError(f'Trade metadata column not found: {column!r}')

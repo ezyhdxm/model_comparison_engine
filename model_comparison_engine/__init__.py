@@ -12,7 +12,7 @@ from .walk_forward import WalkForwardConfig, WalkForwardFold, walk_forward_split
 from .cross_validation import TrainableModel, WalkForwardResult, walk_forward_compare
 
 # CONFIGURATION LOGIC: Public package identity is independent of any input data source.
-__version__ = '0.5.1'
+__version__ = '0.5.2'
 
 def show_comparison(data=None, **kwargs):
     # UI LOGIC: Load optional notebook controls only when explicitly requested.

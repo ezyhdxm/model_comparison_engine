@@ -1,5 +1,25 @@
 # Usage
 
+## Updating an already-running notebook
+
+Replace or update the complete package folder before reloading; copying only `ui.py` can mix incompatible versions. Python also retains imported classes and existing widget callbacks in memory. An error such as `TradeViewConfig.__init__() got an unexpected keyword argument 'point_view'` indicates that the newer controls reached an older constructor.
+
+After updating the files, run this cell. It reloads only diagnostic code and preserves your data, predictions and fitted models:
+
+```python
+# SETUP LOGIC: Reload dependencies before their UI/report consumers; preserve notebook data and model variables.
+import importlib
+for module in ("trade_view", "trade_plots", "report", "ui"):
+    importlib.reload(importlib.import_module(f"model_comparison_engine.{module}"))
+import model_comparison_engine as mce
+importlib.reload(mce)
+from model_comparison_engine import TradeViewConfig, show_comparison
+```
+
+Then rerun the cell that creates the comparison panel and click **Apply comparison on the newly created panel**. Existing widgets keep their old callbacks, so clicking an older panel may repeat the error. Do not rerun training or prediction generation, and do not restart the kernel.
+
+Version 0.5.2 rebuilds retained trade configurations with the currently loaded class, preserving frequency, sampling seed, metadata mappings and advanced limits. Older objects receive defaults for newly added options. If the error persists after reloading, inspect `mce.__version__` and `mce.__file__` to confirm that Python is loading the folder you updated.
+
 ## Inputs and evaluation scope
 
 `compare_predictions` accepts a pandas DataFrame or a local CSV/Parquet path. Declare the actual target column and two different prediction columns. All three must represent compatible numerical values. No model name is privileged: reference and candidate are roles you choose for a particular comparison.

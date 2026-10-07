@@ -18,7 +18,6 @@ from .ui_style import REPORT_STYLE
 from .temporal import TemporalConfig
 from .temporal_plots import temporal_figure, event_lag_figure
 from .temporal_interpretation import temporal_interpretation
-from .trade_view import TradeViewConfig
 
 STYLE = REPORT_STYLE + '''.analysis-report pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .analysis-report .figure-scroll{overflow:auto;max-height:1050px}.analysis-report section{scroll-margin-top:20px}
@@ -202,9 +201,9 @@ def export_comparison(comparison, folder, slices=None, interactions=None, min_co
     temporal_population = candidate_population if temporal_population is None else temporal_population
     if temporal_population not in {'candidate','paired'}:
         raise ValueError("temporal_population must be 'candidate' or 'paired'.")
-    trades = TradeViewConfig(**trades) if isinstance(trades, dict) else trades
-    if trades is not None and not isinstance(trades, TradeViewConfig):
-        raise TypeError('trades must be TradeViewConfig, a configuration dict or None.')
+    if trades is not None:
+        from .trade_view import normalize_trade_config
+        trades = normalize_trade_config(trades)
     # FILE IO LOGIC: Every click creates a separate self-contained review bundle.
     output = Path(folder)/('review_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:8])
     output.mkdir(parents=True,exist_ok=False)

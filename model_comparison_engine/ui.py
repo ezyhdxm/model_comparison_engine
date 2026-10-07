@@ -13,12 +13,21 @@ from .ui_style import control, row, section, disclosure, hero, badge, table_html
 from .engine import Comparison, compare_predictions
 from .inference import InferenceConfig
 from .temporal import TemporalConfig
-from .trade_view import TradeViewConfig
 from .temporal_interpretation import temporal_interpretation
 from . import temporal_plots
 from .diagnostics import candidate_tables
 from .slices import Slice, default_slices
 from . import plots, inference_plots, diagnostic_plots
+
+
+def _trade_configuration(settings=None, **changes):
+    # CONFIGURATION LOGIC: Resolve the live module instead of a class alias cached before a notebook update.
+    from . import trade_view
+    if not hasattr(trade_view, 'normalize_trade_config'):
+        raise RuntimeError(f'The trade-view module is outdated or still cached at {trade_view.__file__}. '
+                           'Update the complete package, then reload trade_view, trade_plots, report, ui and '
+                           'model_comparison_engine in that order and recreate the panel. No kernel restart is needed.')
+    return trade_view.normalize_trade_config(settings, **changes)
 
 
 def _edges(text):
@@ -305,10 +314,7 @@ class ComparisonPanel:
 
     def _make_trade_controls(self):
         # UI LOGIC: Optional role mappings describe transaction records independently of prediction features.
-        settings = TradeViewConfig(**self.trade_defaults) if isinstance(self.trade_defaults,dict) else self.trade_defaults
-        self._trade_config = settings or TradeViewConfig()
-        if not isinstance(self._trade_config,TradeViewConfig):
-            raise TypeError('trades must be a TradeViewConfig, a dictionary, or None.')
+        self._trade_config = _trade_configuration(self.trade_defaults)
         frequencies = [('Auto: based on date span','auto'),('15 minutes','15min'),('30 minutes','30min'),('Hourly','1h'),('Daily','1D')]
         if self._trade_config.frequency not in dict(frequencies).values():
             frequencies.append((self._trade_config.frequency,self._trade_config.frequency))
@@ -602,7 +608,7 @@ class ComparisonPanel:
         # CONFIGURATION LOGIC: Record plotting choices with the applied comparison and its exports.
         if not self.trade_enabled.value:
             return None
-        return replace(self._trade_config,frequency=self.trade_frequency.value,min_count=self.minimum.value,
+        return _trade_configuration(self._trade_config,frequency=self.trade_frequency.value,min_count=self.minimum.value,
                        max_points=self.trade_max_points.value,side_column=self.trade_side.value,
                        counterparty_column=self.trade_counterparty.value,dealer_column=self.trade_dealer.value,
                        quantity_column=self.trade_quantity.value,point_view=self.trade_point_view.value,
